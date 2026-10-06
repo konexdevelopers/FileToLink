@@ -540,18 +540,35 @@ a{color:inherit}
          * /hls-start/123?hash=xxxx
          */
 
-        const currentUrl =
-            window.location.href;
+        const watchUrl =
+    new URL(window.location.href);
 
-        const hlsStartUrl =
-            currentUrl.replace(
-                "/watch/",
-                "/hls-start/"
-            ).replace(
-                /\/[^\/?]+(\?hash=)/,
-                "$1"
-            );
+const pathParts =
+    watchUrl.pathname.split("/");
 
+const watchIndex =
+    pathParts.indexOf("watch");
+
+const fileId =
+    watchIndex >= 0
+        ? pathParts[watchIndex + 1]
+        : null;
+
+const hash =
+    watchUrl.searchParams.get("hash");
+
+if (!fileId || !hash) {
+    throw new Error(
+        "File ID or hash missing"
+    );
+}
+
+const hlsStartUrl =
+    "/hls-start/" +
+    encodeURIComponent(fileId) +
+    "?hash=" +
+    encodeURIComponent(hash);
+		
         console.log(
             "HLS start URL:",
             hlsStartUrl
