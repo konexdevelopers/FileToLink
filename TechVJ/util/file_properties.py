@@ -1,18 +1,15 @@
+import asyncio
+import re
+
 from pyrogram import Client
 from typing import Any, Optional
+
 from pyrogram.types import Message
 from pyrogram.file_id import FileId
 from pyrogram.raw.types.messages import Messages
+
 from TechVJ.server.exceptions import FIleNotFound
 
-import json
-import subprocess
-import imageio_ffmpeg
-
-
-# ============================================================
-# AUDIO LANGUAGE MAP
-# ============================================================
 
 AUDIO_LANGUAGE_MAP = {
     "eng": "English",
@@ -45,18 +42,6 @@ AUDIO_LANGUAGE_MAP = {
     "pan": "Punjabi",
     "pa": "Punjabi",
 
-    "ori": "Odia",
-    "or": "Odia",
-
-    "asm": "Assamese",
-    "as": "Assamese",
-
-    "urd": "Urdu",
-    "ur": "Urdu",
-
-    "nep": "Nepali",
-    "ne": "Nepali",
-
     "spa": "Spanish",
     "es": "Spanish",
 
@@ -73,38 +58,38 @@ AUDIO_LANGUAGE_MAP = {
     "kor": "Korean",
     "ko": "Korean",
 
-    "chi": "Chinese",
-    "zho": "Chinese",
-    "zh": "Chinese",
+    "ara": "Arabic",
+    "ar": "Arabic",
 
     "rus": "Russian",
     "ru": "Russian",
-
-    "ara": "Arabic",
-    "ar": "Arabic",
 }
 
 
-# ============================================================
-# BASIC TELEGRAM FILE FUNCTIONS
-# ============================================================
+async def parse_file_id(
+    message: "Message"
+) -> Optional[FileId]:
 
-async def parse_file_id(message: "Message") -> Optional[FileId]:
-    media = get_media_from_message(message)
+    media = get_media_from_message(
+        message
+    )
 
     if media:
-        return FileId.decode(media.file_id)
+        return FileId.decode(
+            media.file_id
+        )
 
-    return None
 
+async def parse_file_unique_id(
+    message: "Messages"
+) -> Optional[str]:
 
-async def parse_file_unique_id(message: "Messages") -> Optional[str]:
-    media = get_media_from_message(message)
+    media = get_media_from_message(
+        message
+    )
 
     if media:
         return media.file_unique_id
-
-    return None
 
 
 async def get_file_ids(
@@ -113,38 +98,56 @@ async def get_file_ids(
     id: int
 ) -> Optional[FileId]:
 
-    message = await client.get_messages(chat_id, id)
+    message = await client.get_messages(
+        chat_id,
+        id
+    )
 
     if message.empty:
         raise FIleNotFound
 
-    media = get_media_from_message(message)
+    media = get_media_from_message(
+        message
+    )
 
-    if not media:
-        raise FIleNotFound
+    file_unique_id = (
+        await parse_file_unique_id(
+            message
+        )
+    )
 
-    file_unique_id = await parse_file_unique_id(message)
-    file_id = await parse_file_id(message)
-
-    if not file_id:
-        raise FIleNotFound
+    file_id = await parse_file_id(
+        message
+    )
 
     setattr(
         file_id,
         "file_size",
-        getattr(media, "file_size", 0)
+        getattr(
+            media,
+            "file_size",
+            0
+        )
     )
 
     setattr(
         file_id,
         "mime_type",
-        getattr(media, "mime_type", "")
+        getattr(
+            media,
+            "mime_type",
+            ""
+        )
     )
 
     setattr(
         file_id,
         "file_name",
-        getattr(media, "file_name", "")
+        getattr(
+            media,
+            "file_name",
+            ""
+        )
     )
 
     setattr(
@@ -156,7 +159,9 @@ async def get_file_ids(
     return file_id
 
 
-def get_media_from_message(message: "Message") -> Any:
+def get_media_from_message(
+    message: "Message"
+) -> Any:
 
     media_types = (
         "audio",
@@ -171,17 +176,23 @@ def get_media_from_message(message: "Message") -> Any:
 
     for attr in media_types:
 
-        media = getattr(message, attr, None)
+        media = getattr(
+            message,
+            attr,
+            None
+        )
 
         if media:
             return media
 
-    return None
 
+def get_hash(
+    media_msg: Message
+) -> str:
 
-def get_hash(media_msg: Message) -> str:
-
-    media = get_media_from_message(media_msg)
+    media = get_media_from_message(
+        media_msg
+    )
 
     return getattr(
         media,
@@ -190,9 +201,13 @@ def get_hash(media_msg: Message) -> str:
     )[:6]
 
 
-def get_name(media_msg: Message) -> str:
+def get_name(
+    media_msg: Message
+) -> str:
 
-    media = get_media_from_message(media_msg)
+    media = get_media_from_message(
+        media_msg
+    )
 
     return getattr(
         media,
@@ -213,152 +228,88 @@ def get_media_file_size(m):
 
 
 # ============================================================
-# AUDIO LANGUAGE FUNCTIONS
+# AUDIO DETECTION
 # ============================================================
 
-def normalize_audio_language(code):
-
-    if not code:
-        return None
-
-    code = str(code).lower().strip()
-
-    return AUDIO_LANGUAGE_MAP.get(
-        code,
-        code.upper()
-    )
-
-
-def detect_audio_tracks(file_path):
-
-    """
-    Detect audio tracks using FFprobe.
-
-    Example:
-
-    1 track:
-        Single Audio
-        English
-
-    2 tracks:
-        Dual Audio
-        English + Hindi
-
-    3+ tracks:
-        Multi Audio
-        English + Hindi + Tamil
-    """
+async def detect_audio_tracks(
+    source_url: str
+):
 
     try:
 
-        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-
-        # imageio-ffmpeg normally provides ffmpeg.
-        # Try to locate ffprobe beside it.
-        ffprobe_path = ffmpeg_path.replace(
-            "ffmpeg",
-            "ffprobe"
+        from imageio_ffmpeg import (
+            get_ffmpeg_exe
         )
 
-        command = [
-            ffprobe_path,
+        ffmpeg = get_ffmpeg_exe()
 
-            "-v",
-            "error",
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-hide_banner",
+            "-i",
+            source_url,
 
-            "-select_streams",
-            "a",
-
-            "-show_entries",
-            "stream=index:stream_tags=language,title",
-
-            "-of",
-            "json",
-
-            str(file_path)
-        ]
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=30
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
 
-        if result.returncode != 0:
-            return {
-                "type": "Unknown",
-                "count": 0,
-                "tracks": []
-            }
+        _, stderr = await process.communicate()
 
-        data = json.loads(
-            result.stdout or "{}"
-        )
-
-        streams = data.get(
-            "streams",
-            []
+        output = stderr.decode(
+            "utf-8",
+            errors="ignore"
         )
 
         tracks = []
 
-        for index, stream in enumerate(
-            streams,
+        # Example:
+        # Stream #0:1(eng): Audio:
+        # Stream #0:2(hin): Audio:
+
+        pattern = re.compile(
+            r"Stream #0:(\d+)"
+            r"(?:\(([^)]+)\))?"
+            r": Audio:"
+        )
+
+        for match in pattern.finditer(
+            output
         ):
 
-            tags = stream.get(
-                "tags",
-                {}
+            stream_number = int(
+                match.group(1)
             )
 
-            language = normalize_audio_language(
-                tags.get("language")
+            language_code = (
+                match.group(2)
+                or "und"
+            ).lower()
+
+            language = (
+                AUDIO_LANGUAGE_MAP.get(
+                    language_code,
+                    language_code.upper()
+                    if language_code != "und"
+                    else f"Track {len(tracks) + 1}"
+                )
             )
 
-            title = tags.get(
-                "title"
-            )
-
-            display_language = (
-                language
-                or title
-                or f"Track {index}"
-            )
-
+            # FFmpeg's 0:a:N uses audio
+            # stream order, not absolute stream ID.
             tracks.append({
-                "index": index,
-                "language": display_language
+                "index": len(tracks),
+                "stream": stream_number,
+                "code": language_code,
+                "language": language,
             })
 
-        count = len(tracks)
+        return tracks
 
-        if count == 0:
+    except Exception as e:
 
-            audio_type = "Unknown"
+        print(
+            "Audio detection error:",
+            e
+        )
 
-        elif count == 1:
-
-            audio_type = "Single Audio"
-
-        elif count == 2:
-
-            audio_type = "Dual Audio"
-
-        else:
-
-            audio_type = "Multi Audio"
-
-        return {
-            "type": audio_type,
-            "count": count,
-            "tracks": tracks
-        }
-
-    except Exception:
-
-        return {
-            "type": "Unknown",
-            "count": 0,
-            "tracks": []
-        }
+        return []
