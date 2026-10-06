@@ -305,7 +305,6 @@ def detect_audio_tracks(file_path):
 
         for index, stream in enumerate(
             streams,
-            start=1
         ):
 
             tags = stream.get(
