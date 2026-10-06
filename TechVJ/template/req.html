@@ -138,10 +138,16 @@ a{color:inherit}
                     <video id="player" class="player " playsinline controls>
                         <source src="{{file_url}}" type="video/mp4">
                     </video>
-                    <div id="cv-loading" class="cv-load is-on" role="status" aria-live="polite">
-                        <span class="cv-spin" aria-hidden="true"></span>
-                        <span>Loading video&hellip;</span>
-                    </div>
+                    <div id="cv-audio-wrap" hidden style="padding:12px 14px;background:#0d0d12;border-top:1px solid rgba(255,255,255,.08);">
+    <label for="cv-audio-select" style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#c9c9d3;margin-bottom:7px;">
+        <i class="bi bi-volume-up-fill" aria-hidden="true"></i>
+        Audio
+    </label>
+
+    <select id="cv-audio-select"
+        style="width:100%;height:44px;padding:0 12px;border:1px solid rgba(255,255,255,.15);border-radius:12px;background:#15151c;color:#f4f4f6;font:inherit;">
+    </select>
+</div>
                 </div>
             </section>
 
@@ -234,29 +240,419 @@ a{color:inherit}
 
     </script>
     
-    <script src="https://cdn.plyr.io/3.6.9/plyr.js"></script>
-	<script>
-        const controls = [
-            'play-large',
-            'rewind','play', 
-            'fast-forward', 
-            'progress', 
-            'current-time',
-            'duration',
-            'mute',
-            'volume',
-            'captions',
-            'settings',
-            'pip',
-            'airplay',
-            'download',
-            'fullscreen'
-        ];
-        document.addEventListener('DOMContentLoaded', () => {
-            const player = Plyr.setup('.player', { controls });
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17"></script>
+<script src="https://cdn.plyr.io/3.6.9/plyr.js"></script>
+
+<script>
+(function () {
+
+    "use strict";
+
+    const video = document.getElementById("player");
+    const loading = document.getElementById("cv-loading");
+    const errorBox = document.getElementById("cv-error");
+
+    const audioWrap = document.getElementById("cv-audio-wrap");
+    const audioSelect = document.getElementById("cv-audio-select");
+
+    if (!video) return;
+
+    const controls = [
+        "play-large",
+        "rewind",
+        "play",
+        "fast-forward",
+        "progress",
+        "current-time",
+        "duration",
+        "mute",
+        "volume",
+        "captions",
+        "settings",
+        "pip",
+        "airplay",
+        "fullscreen"
+    ];
+
+    let player = null;
+    let hls = null;
+
+    function showLoading() {
+        if (loading) {
+            loading.classList.add("is-on");
+        }
+    }
+
+    function hideLoading() {
+        if (loading) {
+            loading.classList.remove("is-on");
+        }
+    }
+
+    function showError() {
+        hideLoading();
+
+        if (errorBox) {
+            errorBox.hidden = false;
+        }
+    }
+
+    function hideError() {
+        if (errorBox) {
+            errorBox.hidden = true;
+        }
+    }
+
+    function createPlyr() {
+
+        if (player) {
+            try {
+                player.destroy();
+            } catch (e) {}
+        }
+
+        player = new Plyr(video, {
+            controls: controls,
+            settings: ["quality", "speed"],
+            ratio: "16:9"
         });
 
-    </script>
+        video.addEventListener("loadeddata", hideLoading);
+        video.addEventListener("canplay", hideLoading);
+        video.addEventListener("playing", hideLoading);
+
+        video.addEventListener("waiting", showLoading);
+
+        video.addEventListener("error", function () {
+            showError();
+        });
+    }
+
+    function addAudioTracks(tracks) {
+
+        if (!tracks || !tracks.length) {
+            audioWrap.hidden = true;
+            return;
+        }
+
+        audioSelect.innerHTML = "";
+
+        tracks.forEach(function (track, index) {
+
+            const option = document.createElement("option");
+
+            option.value = index;
+
+            option.textContent =
+                track.language ||
+                ("Track " + (index + 1));
+
+            audioSelect.appendChild(option);
+        });
+
+        audioWrap.hidden = false;
+    }
+
+    function connectAudioSelector() {
+
+        audioSelect.addEventListener(
+            "change",
+            function () {
+
+                if (!hls) return;
+
+                const index = parseInt(
+                    this.value,
+                    10
+                );
+
+                if (
+                    Number.isInteger(index) &&
+                    hls.audioTracks[index]
+                ) {
+
+                    hls.audioTrack = index;
+                }
+            }
+        );
+    }
+
+    function loadHLS(masterUrl, tracks) {
+
+        addAudioTracks(tracks);
+
+        if (
+            window.Hls &&
+            Hls.isSupported()
+        ) {
+
+            hls = new Hls({
+                enableWorker: true,
+                lowLatencyMode: false,
+                backBufferLength: 90
+            });
+
+            hls.loadSource(masterUrl);
+
+            hls.attachMedia(video);
+
+            hls.on(
+                Hls.Events.MANIFEST_PARSED,
+                function () {
+
+                    hideLoading();
+                    hideError();
+
+                    /*
+                     * HLS.js audio tracks may contain
+                     * names supplied by the master playlist.
+                     */
+
+                    if (
+                        hls.audioTracks &&
+                        hls.audioTracks.length
+                    ) {
+
+                        audioSelect.innerHTML = "";
+
+                        hls.audioTracks.forEach(
+                            function (track, index) {
+
+                                const option =
+                                    document.createElement(
+                                        "option"
+                                    );
+
+                                option.value = index;
+
+                                option.textContent =
+                                    track.name ||
+                                    track.lang ||
+                                    ("Track " + (index + 1));
+
+                                audioSelect.appendChild(
+                                    option
+                                );
+                            }
+                        );
+
+                        audioWrap.hidden = false;
+
+                        /*
+                         * First track by default.
+                         */
+                        hls.audioTrack = 0;
+                    }
+                }
+            );
+
+            hls.on(
+                Hls.Events.ERROR,
+                function (event, data) {
+
+                    console.error(
+                        "HLS error:",
+                        data
+                    );
+
+                    if (data.fatal) {
+
+                        switch (data.type) {
+
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+
+                                console.log(
+                                    "Trying to recover network..."
+                                );
+
+                                hls.startLoad();
+                                break;
+
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+
+                                console.log(
+                                    "Trying to recover media..."
+                                );
+
+                                hls.recoverMediaError();
+                                break;
+
+                            default:
+
+                                showError();
+                                break;
+                        }
+                    }
+                }
+            );
+
+        } else if (
+            video.canPlayType(
+                "application/vnd.apple.mpegurl"
+            )
+        ) {
+
+            /*
+             * Safari / native HLS
+             */
+
+            video.src = masterUrl;
+
+            video.addEventListener(
+                "loadedmetadata",
+                function () {
+
+                    hideLoading();
+                    hideError();
+                },
+                {
+                    once: true
+                }
+            );
+
+        } else {
+
+            console.log(
+                "HLS is not supported."
+            );
+
+            showError();
+        }
+    }
+
+    async function start() {
+
+        showLoading();
+
+        hideError();
+
+        createPlyr();
+
+        connectAudioSelector();
+
+        /*
+         * Current page:
+         *
+         * /watch/123/file.mkv?hash=xxxx
+         *
+         * Convert to:
+         *
+         * /hls-start/123?hash=xxxx
+         */
+
+        const currentUrl =
+            window.location.href;
+
+        const hlsStartUrl =
+            currentUrl.replace(
+                "/watch/",
+                "/hls-start/"
+            ).replace(
+                /\/[^\/?]+(\?hash=)/,
+                "$1"
+            );
+
+        console.log(
+            "HLS start URL:",
+            hlsStartUrl
+        );
+
+        try {
+
+            const response =
+                await fetch(
+                    hlsStartUrl,
+                    {
+                        method: "GET",
+                        cache: "no-store"
+                    }
+                );
+
+            if (!response.ok) {
+
+                throw new Error(
+                    "HLS start failed: " +
+                    response.status
+                );
+            }
+
+            const data =
+                await response.json();
+
+            if (
+                !data.master
+            ) {
+
+                throw new Error(
+                    "HLS master playlist missing"
+                );
+            }
+
+            console.log(
+                "HLS master:",
+                data.master
+            );
+
+            console.log(
+                "Audio tracks:",
+                data.audio_tracks
+            );
+
+            loadHLS(
+                data.master,
+                data.audio_tracks || []
+            );
+
+        } catch (error) {
+
+            console.error(
+                "HLS initialization failed:",
+                error
+            );
+
+            /*
+             * Fallback to original direct
+             * Telegram streaming URL.
+             */
+
+            console.log(
+                "Falling back to normal player..."
+            );
+
+            video.src =
+                "{{file_url}}";
+
+            video.load();
+
+            video.addEventListener(
+                "loadeddata",
+                hideLoading,
+                {
+                    once: true
+                }
+            );
+
+            video.addEventListener(
+                "error",
+                showError,
+                {
+                    once: true
+                }
+            );
+        }
+    }
+
+    /*
+     * Start after DOM is ready.
+     */
+
+    document.addEventListener(
+        "DOMContentLoaded",
+        start
+    );
+
+})();
+</script>
     <!-- iterate animation -->
 
 
