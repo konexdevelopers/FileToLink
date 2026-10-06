@@ -8,28 +8,21 @@ import imageio_ffmpeg
 
 logger = logging.getLogger(__name__)
 
-
-# Temporary HLS files
 HLS_ROOT = Path("hls_cache")
 HLS_ROOT.mkdir(parents=True, exist_ok=True)
 
-
-# Keep a limited number of active HLS jobs
 _jobs = {}
 
 
 def get_ffmpeg():
-    """
-    Get the FFmpeg executable supplied by imageio-ffmpeg.
-    """
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def get_job_dir(file_id: int):
+def get_job_dir(file_id: int) -> Path:
     return HLS_ROOT / str(file_id)
 
 
-def is_running(file_id: int):
+def is_running(file_id: int) -> bool:
     job = _jobs.get(file_id)
 
     if not job:
@@ -37,17 +30,13 @@ def is_running(file_id: int):
 
     process = job.get("process")
 
-    if not process:
-        return False
-
-    return process.returncode is None
+    return (
+        process is not None
+        and process.returncode is None
+    )
 
 
 async def stop_hls(file_id: int):
-    """
-    Stop an existing HLS process.
-    """
-
     job = _jobs.pop(file_id, None)
 
     if not job:
@@ -56,7 +45,6 @@ async def stop_hls(file_id: int):
     process = job.get("process")
 
     if process and process.returncode is None:
-
         try:
             process.terminate()
 
@@ -66,179 +54,123 @@ async def stop_hls(file_id: int):
             )
 
         except asyncio.TimeoutError:
-
             try:
                 process.kill()
             except Exception:
                 pass
 
-        except Exception:
-            pass
-
-
-def cleanup_hls(file_id: int):
-    """
-    Remove generated HLS files.
-    """
-
-    directory = get_job_dir(file_id)
-
-    if directory.exists():
-
-        try:
-            shutil.rmtree(directory)
-
         except Exception as e:
             logger.warning(
-                "Unable to remove HLS directory %s: %s",
-                directory,
+                "Error stopping HLS process: %s",
                 e
             )
 
 
+def cleanup_hls(file_id: int):
+    directory = get_job_dir(file_id)
+
+    if directory.exists():
+        try:
+            shutil.rmtree(directory)
+        except Exception as e:
+            logger.warning(
+                "Unable to clean HLS directory: %s",
+                e
+            )
+
+
+def _safe_name(name: str) -> str:
+    return "".join(
+        char
+        for char in str(name)
+        if char.isalnum() or char in "_-"
+    )
+
+
 async def create_hls(
     file_id: int,
-    source_url: str
+    source_url: str,
+    audio_tracks: list
 ):
     """
-    Create an HLS stream from the supplied media URL.
+    Creates one HLS process containing:
 
-    The source can be the bot's existing media URL.
+        Video + Audio 1
+        Video + Audio 2
+        Video + Audio 3
+        ...
+
+    This allows the player to switch between audio renditions.
     """
 
     if is_running(file_id):
+        return get_job_dir(file_id) / "master.m3u8"
 
-        return get_job_dir(file_id)
+    await stop_hls(file_id)
 
-    # Remove previous files
     cleanup_hls(file_id)
 
     output_dir = get_job_dir(file_id)
+
     output_dir.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    ffmpeg = get_ffmpeg()
+    if not audio_tracks:
+        raise ValueError(
+            "No audio tracks available"
+        )
 
-    video_playlist = output_dir / "video.m3u8"
+    ffmpeg = get_ffmpeg()
 
     command = [
         ffmpeg,
 
         "-hide_banner",
-        "-loglevel", "warning",
+        "-loglevel",
+        "warning",
 
-        # Input
         "-i",
         source_url,
-
-        # First video stream
-        "-map",
-        "0:v:0",
-
-        # Copy video whenever possible
-        "-c:v",
-        "copy",
-
-        # HLS
-        "-f",
-        "hls",
-
-        "-hls_time",
-        "4",
-
-        "-hls_list_size",
-        "6",
-
-        "-hls_flags",
-        "independent_segments",
-
-        "-hls_segment_filename",
-        str(output_dir / "video_%05d.ts"),
-
-        str(video_playlist)
     ]
 
-    logger.info(
-        "Starting HLS video process for file %s",
-        file_id
-    )
+    # ---------------------------------------------------------
+    # MAP VIDEO
+    # ---------------------------------------------------------
 
-    try:
-
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "Unable to start FFmpeg"
-        )
-
-        cleanup_hls(file_id)
-
-        raise e
-
-    _jobs[file_id] = {
-        "process": process,
-        "directory": output_dir,
-        "source_url": source_url
-    }
-
-    return output_dir
-
-
-async def create_audio_hls(
-    file_id: int,
-    source_url: str,
-    audio_index: int,
-    language: str
-):
-    """
-    Create one HLS audio rendition.
-
-    audio_index:
-        0 = first audio stream
-        1 = second audio stream
-        2 = third audio stream
-        ...
-    """
-
-    directory = get_job_dir(file_id)
-
-    directory.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    ffmpeg = get_ffmpeg()
-
-    safe_language = "".join(
-        c for c in language
-        if c.isalnum() or c in ("_", "-")
-    )
-
-    playlist = directory / (
-        f"audio_{audio_index}_{safe_language}.m3u8"
-    )
-
-    command = [
-        ffmpeg,
-
-        "-hide_banner",
-        "-loglevel", "warning",
-
-        "-i",
-        source_url,
-
+    command.extend([
         "-map",
-        f"0:a:{audio_index}",
+        "0:v:0",
+    ])
 
-        # Browser-friendly audio
+    # ---------------------------------------------------------
+    # MAP EVERY AUDIO TRACK
+    # ---------------------------------------------------------
+
+    for track in audio_tracks:
+
+        index = track["index"]
+
+        command.extend([
+            "-map",
+            f"0:a:{index}",
+        ])
+
+    # ---------------------------------------------------------
+    # VIDEO
+    # ---------------------------------------------------------
+
+    command.extend([
+        "-c:v",
+        "copy",
+    ])
+
+    # ---------------------------------------------------------
+    # AUDIO
+    # ---------------------------------------------------------
+
+    command.extend([
         "-c:a",
         "aac",
 
@@ -250,7 +182,13 @@ async def create_audio_hls(
 
         "-ar",
         "48000",
+    ])
 
+    # ---------------------------------------------------------
+    # HLS
+    # ---------------------------------------------------------
+
+    command.extend([
         "-f",
         "hls",
 
@@ -258,100 +196,140 @@ async def create_audio_hls(
         "4",
 
         "-hls_list_size",
-        "6",
+        "8",
 
         "-hls_flags",
         "independent_segments",
 
-        "-hls_segment_filename",
-        str(
-            directory /
-            f"audio_{audio_index}_{safe_language}_%05d.ts"
-        ),
+        "-master_pl_name",
+        "master.m3u8",
+    ])
 
-        str(playlist)
-    ]
+    # ---------------------------------------------------------
+    # CREATE VARIANTS
+    #
+    # Example:
+    #
+    # v:0,a:0
+    # v:0,a:1
+    # v:0,a:2
+    # ---------------------------------------------------------
 
-    logger.info(
-        "Starting HLS audio process: file=%s audio=%s language=%s",
-        file_id,
-        audio_index,
-        language
-    )
-
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    return process, playlist
-
-
-def create_master_playlist(
-    file_id: int,
-    audio_tracks
-):
-    """
-    Create the HLS master playlist.
-
-    audio_tracks example:
-
-    [
-        {
-            "index": 0,
-            "language": "English",
-            "playlist": "audio_0_English.m3u8"
-        },
-        {
-            "index": 1,
-            "language": "Hindi",
-            "playlist": "audio_1_Hindi.m3u8"
-        }
-    ]
-    """
-
-    directory = get_job_dir(file_id)
-
-    master = directory / "master.m3u8"
-
-    lines = [
-        "#EXTM3U",
-        "#EXT-X-VERSION:3",
-        ""
-    ]
+    variants = []
 
     for position, track in enumerate(audio_tracks):
 
-        language = track["language"]
-        playlist = track["playlist"]
-
-        default = "YES" if position == 0 else "NO"
-
-        lines.append(
-            "#EXT-X-MEDIA:"
-            f'TYPE=AUDIO,'
-            f'GROUP-ID="audio",'
-            f'NAME="{language}",'
-            f'LANGUAGE="{language.lower()}",'
-            f'DEFAULT={default},'
-            f'AUTOSELECT=YES,'
-            f'URI="{playlist}"'
+        language = _safe_name(
+            track.get(
+                "language",
+                f"Track_{position + 1}"
+            )
         )
 
-    lines.extend([
-        "",
-        '#EXT-X-STREAM-INF:BANDWIDTH=2500000,'
-        'CODECS="avc1.640028,mp4a.40.2",'
-        'AUDIO="audio"',
-        "video.m3u8",
-        ""
+        variants.append(
+            f"v:0,a:{position},"
+            f"name:{language}"
+        )
+
+    var_stream_map = " ".join(variants)
+
+    command.extend([
+        "-var_stream_map",
+        var_stream_map,
+
+        "-hls_segment_filename",
+        str(
+            output_dir /
+            "stream_%v_%05d.ts"
+        ),
+
+        str(
+            output_dir /
+            "stream_%v.m3u8"
+        ),
     ])
 
-    master.write_text(
-        "\n".join(lines),
-        encoding="utf-8"
+    logger.info(
+        "Starting single HLS process for file %s",
+        file_id
     )
+
+    logger.debug(
+        "FFmpeg command: %s",
+        " ".join(command)
+    )
+
+    try:
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+
+            stdout=asyncio.subprocess.DEVNULL,
+
+            stderr=asyncio.subprocess.PIPE
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Failed to start FFmpeg"
+        )
+
+        cleanup_hls(file_id)
+
+        raise e
+
+    _jobs[file_id] = {
+        "process": process,
+        "directory": output_dir,
+        "source_url": source_url,
+        "audio_tracks": audio_tracks,
+    }
+
+    # ---------------------------------------------------------
+    # Wait briefly for master playlist
+    # ---------------------------------------------------------
+
+    master = output_dir / "master.m3u8"
+
+    for _ in range(50):
+
+        if master.exists():
+            break
+
+        if process.returncode is not None:
+
+            stderr = b""
+
+            try:
+                stderr = await process.stderr.read()
+            except Exception:
+                pass
+
+            logger.error(
+                "FFmpeg stopped while creating HLS: %s",
+                stderr.decode(
+                    errors="ignore"
+                )
+            )
+
+            cleanup_hls(file_id)
+
+            raise RuntimeError(
+                "FFmpeg could not create HLS stream"
+            )
+
+        await asyncio.sleep(0.2)
+
+    if not master.exists():
+
+        await stop_hls(file_id)
+
+        cleanup_hls(file_id)
+
+        raise RuntimeError(
+            "HLS master playlist was not created"
+        )
 
     return master
 
@@ -359,78 +337,49 @@ def create_master_playlist(
 async def get_or_create_hls(
     file_id: int,
     source_url: str,
-    audio_tracks
+    audio_tracks: list
 ):
     """
-    Start HLS generation if it isn't already running.
+    Return existing HLS playlist or create a new one.
     """
 
-    directory = get_job_dir(file_id)
+    master = (
+        get_job_dir(file_id) /
+        "master.m3u8"
+    )
 
-    master = directory / "master.m3u8"
-
-    if master.exists() and is_running(file_id):
-
+    if (
+        master.exists()
+        and is_running(file_id)
+    ):
         return master
 
-    await stop_hls(file_id)
-
-    cleanup_hls(file_id)
-
-    directory.mkdir(
-        parents=True,
-        exist_ok=True
+    return await create_hls(
+        file_id=file_id,
+        source_url=source_url,
+        audio_tracks=audio_tracks,
     )
-
-    # Start video HLS
-    await create_hls(
-        file_id,
-        source_url
-    )
-
-    generated_audio = []
-
-    # Start one audio HLS process per audio track
-    for track in audio_tracks:
-
-        index = track["index"]
-        language = track["language"]
-
-        process, playlist = await create_audio_hls(
-            file_id,
-            source_url,
-            index,
-            language
-        )
-
-        generated_audio.append({
-            "index": index,
-            "language": language,
-            "playlist": playlist.name
-        })
-
-    # Create master playlist
-    create_master_playlist(
-        file_id,
-        generated_audio
-    )
-
-    return master
 
 
 async def cleanup_all():
     """
-    Stop all active HLS processes.
+    Stop all FFmpeg processes and
+    remove generated HLS files.
     """
 
     for file_id in list(_jobs.keys()):
-
         await stop_hls(file_id)
 
     if HLS_ROOT.exists():
-
         try:
             shutil.rmtree(HLS_ROOT)
+        except Exception as e:
+            logger.warning(
+                "Unable to clean HLS root: %s",
+                e
+            )
 
-        except Exception:
-            pass
+    HLS_ROOT.mkdir(
+        parents=True,
+        exist_ok=True
+    )
