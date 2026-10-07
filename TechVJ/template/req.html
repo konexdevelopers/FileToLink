@@ -101,6 +101,12 @@ a{color:inherit}
 .cv-app:active{transform:translateY(0)}
 .cv-dlwrap{display:grid;margin-top:14px}
 .cv-dl{display:flex;min-height:58px;font-size:17px}
+/* audio menu inside the Plyr settings popup */
+.cv-audio-static::after{display:none!important}
+.cv-audio-static{cursor:default}
+.cv-audio-note{margin:0;padding:2px 14px 10px;font-size:12.5px;line-height:1.4;opacity:.8}
+.cv-audio-note:empty{display:none}
+.cv-audio-list [aria-disabled="true"]{opacity:.55;cursor:not-allowed}
 @media (min-width:640px){.cv-apps{grid-template-columns:repeat(3,minmax(0,1fr))}.cv-dlwrap{justify-content:start}.cv-dl{padding:0 34px}}
 @media (min-width:1000px){.cv-frame{padding:1.5px}}
 </style>
@@ -138,16 +144,6 @@ a{color:inherit}
                     <video id="player" class="player " playsinline controls>
                         <source src="{{file_url}}" type="video/mp4">
                     </video>
-                    <div id="cv-audio-wrap" hidden style="padding:12px 14px;background:#0d0d12;border-top:1px solid rgba(255,255,255,.08);">
-    <label for="cv-audio-select" style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#c9c9d3;margin-bottom:7px;">
-        <i class="bi bi-volume-up-fill" aria-hidden="true"></i>
-        Audio
-    </label>
-
-    <select id="cv-audio-select"
-        style="width:100%;height:44px;padding:0 12px;border:1px solid rgba(255,255,255,.15);border-radius:12px;background:#15151c;color:#f4f4f6;font:inherit;">
-    </select>
-</div>
                 </div>
             </section>
 
@@ -240,436 +236,369 @@ a{color:inherit}
 
     </script>
     
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17"></script>
-<script src="https://cdn.plyr.io/3.6.9/plyr.js"></script>
-
-<script>
-(function () {
-
-    "use strict";
-
-    const video = document.getElementById("player");
-    const loading = document.getElementById("cv-loading");
-    const errorBox = document.getElementById("cv-error");
-
-    const audioWrap = document.getElementById("cv-audio-wrap");
-    const audioSelect = document.getElementById("cv-audio-select");
-
-    if (!video) return;
-
-    const controls = [
-        "play-large",
-        "rewind",
-        "play",
-        "fast-forward",
-        "progress",
-        "current-time",
-        "duration",
-        "mute",
-        "volume",
-        "captions",
-        "settings",
-        "pip",
-        "airplay",
-        "fullscreen"
-    ];
-
-    let player = null;
-    let hls = null;
-
-    function showLoading() {
-        if (loading) {
-            loading.classList.add("is-on");
-        }
-    }
-
-    function hideLoading() {
-        if (loading) {
-            loading.classList.remove("is-on");
-        }
-    }
-
-    function showError() {
-        hideLoading();
-
-        if (errorBox) {
-            errorBox.hidden = false;
-        }
-    }
-
-    function hideError() {
-        if (errorBox) {
-            errorBox.hidden = true;
-        }
-    }
-
-    function createPlyr() {
-
-        if (player) {
-            try {
-                player.destroy();
-            } catch (e) {}
-        }
-
-        player = new Plyr(video, {
-            controls: controls,
-            settings: ["quality", "speed"],
-            ratio: "16:9"
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js" integrity="sha384-9v3HcdYrO3D+OPDTjZ40RXocgE4GtXVCd3/mCS62JsM93JXgI1afJVuwjFvsu6ni" crossorigin="anonymous"></script>
+    <script src="https://cdn.plyr.io/3.6.9/plyr.js"></script>
+	<script>
+        const controls = [
+            'play-large',
+            'rewind','play', 
+            'fast-forward', 
+            'progress', 
+            'current-time',
+            'duration',
+            'mute',
+            'volume',
+            'captions',
+            'settings',
+            'pip',
+            'airplay',
+            'download',
+            'fullscreen'
+        ];
+        document.addEventListener('DOMContentLoaded', () => {
+            // `download` keeps pointing at the original file even while HLS (a blob URL) is playing
+            const player = Plyr.setup('.player', { controls, urls: { download: "{{file_url}}" } });
+            window.cvPlayer = player && player[0];
         });
 
-        video.addEventListener("loadeddata", hideLoading);
-        video.addEventListener("canplay", hideLoading);
-        video.addEventListener("playing", hideLoading);
+    </script>
 
-        video.addEventListener("waiting", showLoading);
+    <!-- Real audio-track switching (normal playback first; HLS is only used when a file has 2+ audio tracks) -->
+    <script>
+    (function () {
+        "use strict";
 
-        video.addEventListener("error", function () {
-            showError();
-        });
-    }
+        var FILE_ID = "{{file_id}}";
+        var HASH = "{{secure_hash}}";
+        var video = document.getElementById("player");
+        if (!video || !window.fetch) { return; }
 
-    function addAudioTracks(tracks) {
+        var player = null;
+        var tracks = [];            // real tracks reported by the server
+        var defaultIndex = 0;
+        var selected = -1;          // track that is ACTUALLY playing (-1 = unknown / not switchable yet)
+        var wanted = -1;            // track the viewer asked for while HLS is still starting
+        var mode = "direct";        // "direct" (original file) | "hls"
+        var hls = null;
+        var hlsInfo = null;
+        var starting = null;
+        var switchable = false;
+        var recoverCount = 0;
+        var ui = null;
 
-        if (!tracks || !tracks.length) {
-            audioWrap.hidden = true;
-            return;
+        /* ------------------------------------------------------------ server calls ---- */
+
+        function getJson(path) {
+            return fetch(path, { cache: "no-store", credentials: "same-origin" }).then(function (response) {
+                return response.json().catch(function () { return {}; }).then(function (data) {
+                    return { ok: response.ok, status: response.status, data: data || {} };
+                });
+            });
         }
 
-        audioSelect.innerHTML = "";
+        function query() { return FILE_ID + "?hash=" + encodeURIComponent(HASH); }
 
-        tracks.forEach(function (track, index) {
-
-            const option = document.createElement("option");
-
-            option.value = index;
-
-            option.textContent =
-                track.language ||
-                ("Track " + (index + 1));
-
-            audioSelect.appendChild(option);
-        });
-
-        audioWrap.hidden = false;
-    }
-
-    function connectAudioSelector() {
-
-        audioSelect.addEventListener(
-            "change",
-            function () {
-
-                if (!hls) return;
-
-                const index = parseInt(
-                    this.value,
-                    10
-                );
-
-                if (
-                    Number.isInteger(index) &&
-                    hls.audioTracks[index]
-                ) {
-
-                    hls.audioTrack = index;
+        function ensureHls() {
+            if (hlsInfo) { return Promise.resolve(hlsInfo); }
+            if (starting) { return starting; }
+            if (ui) { ui.note("Preparing audio tracks\u2026"); }
+            starting = getJson("/hls-start/" + query()).then(function (r) {
+                if (!r.ok || r.data.status !== "ok" || !r.data.master) {
+                    var error = new Error(r.data.message || "Audio switching is not available");
+                    error.code = r.data.code;
+                    throw error;
                 }
+                hlsInfo = r.data;
+                return hlsInfo;
+            });
+            starting = starting.then(function (v) { starting = null; return v; }, function (e) { starting = null; throw e; });
+            return starting;
+        }
+
+        /* --------------------------------------------------- Plyr "Audio" settings menu ---- */
+
+        function el(tag, attrs, text) {
+            var node = document.createElement(tag);
+            Object.keys(attrs || {}).forEach(function (k) { node.setAttribute(k, attrs[k]); });
+            if (text) { node.textContent = text; }   // textContent only: labels come from file metadata
+            return node;
+        }
+
+        function buildMenu() {
+            var s = player && player.elements && player.elements.settings;
+            var home = s && s.panels && s.panels.home;
+            if (!home) { return null; }
+            var homeMenu = home.querySelector('[role="menu"]');
+            var inner = home.parentNode;
+            var id = "plyr-settings-" + player.id + "-audio";
+
+            var row = el("button", { type: "button", "class": "plyr__control plyr__control--forward", role: "menuitem", "aria-haspopup": "true" });
+            var rowLabel = el("span", {}, "Audio");
+            var rowValue = el("span", { "class": "plyr__menu__value" });
+            rowLabel.appendChild(rowValue);
+            row.appendChild(rowLabel);
+            homeMenu.insertBefore(row, homeMenu.firstChild);
+
+            var pane = el("div", { id: id, hidden: "" });
+            var back = el("button", { type: "button", "class": "plyr__control plyr__control--back" });
+            back.appendChild(el("span", { "aria-hidden": "true" }, "Audio"));
+            back.appendChild(el("span", { "class": "plyr--hidden" }, "Go back to previous menu"));
+            var list = el("div", { role: "menu", "class": "cv-audio-list" });
+            var note = el("p", { "class": "cv-audio-note", role: "status", "aria-live": "polite" });
+            pane.appendChild(back);
+            pane.appendChild(list);
+            pane.appendChild(note);
+            inner.appendChild(pane);
+
+            function show(target) {
+                Array.prototype.forEach.call(inner.children, function (c) { c.hidden = (c !== target); });
+                var first = target.querySelector('[role^="menuitem"]');
+                if (first) { try { first.focus({ preventScroll: true }); } catch (e) { first.focus(); } }
             }
-        );
-    }
-
-    function loadHLS(masterUrl, tracks) {
-
-        addAudioTracks(tracks);
-
-        if (
-            window.Hls &&
-            Hls.isSupported()
-        ) {
-
-            hls = new Hls({
-                enableWorker: true,
-                lowLatencyMode: false,
-                backBufferLength: 90
+            row.addEventListener("click", function () { if (row.getAttribute("aria-disabled") !== "true") { show(pane); } });
+            back.addEventListener("click", function () { show(home); });
+            pane.addEventListener("keydown", function (e) {
+                if (e.key === "ArrowLeft") { e.preventDefault(); e.stopPropagation(); show(home); }
+                else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                    var items = Array.prototype.slice.call(list.querySelectorAll('[role="menuitemradio"]'));
+                    var at = items.indexOf(document.activeElement);
+                    var next = items[(at + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length];
+                    if (next) { e.preventDefault(); next.focus(); }
+                }
+            });
+            row.addEventListener("keydown", function (e) {
+                if (e.key === "ArrowRight" && row.getAttribute("aria-disabled") !== "true") { e.preventDefault(); show(pane); }
             });
 
-            hls.loadSource(masterUrl);
-
-            hls.attachMedia(video);
-
-            hls.on(
-                Hls.Events.MANIFEST_PARSED,
-                function () {
-
-                    hideLoading();
-                    hideError();
-
-                    /*
-                     * HLS.js audio tracks may contain
-                     * names supplied by the master playlist.
-                     */
-
-                    if (
-                        hls.audioTracks &&
-                        hls.audioTracks.length
-                    ) {
-
-                        audioSelect.innerHTML = "";
-
-                        hls.audioTracks.forEach(
-                            function (track, index) {
-
-                                const option =
-                                    document.createElement(
-                                        "option"
-                                    );
-
-                                option.value = index;
-
-                                option.textContent =
-                                    track.name ||
-                                    track.lang ||
-                                    ("Track " + (index + 1));
-
-                                audioSelect.appendChild(
-                                    option
-                                );
-                            }
-                        );
-
-                        audioWrap.hidden = false;
-
-                        /*
-                         * First track by default.
-                         */
-                        hls.audioTrack = 0;
-                    }
+            var items = [];
+            tracks.forEach(function (track, i) {
+                var item = el("button", { type: "button", "class": "plyr__control", role: "menuitemradio", "aria-checked": "false", value: String(i) });
+                item.appendChild(el("span", {}, track.label || ("Track " + (i + 1))));
+                if (track.channels > 2 || (track.channel_layout && /\d\.\d/.test(track.channel_layout))) {
+                    item.title = track.channel_layout || (track.channels + " channels");
                 }
-            );
+                item.addEventListener("click", function (e) {
+                    e.preventDefault(); e.stopPropagation();
+                    if (item.getAttribute("aria-disabled") === "true") { return; }
+                    requestTrack(i);
+                    show(home);
+                });
+                list.appendChild(item);
+                items.push(item);
+            });
 
-            hls.on(
-                Hls.Events.ERROR,
-                function (event, data) {
-
-                    console.error(
-                        "HLS error:",
-                        data
-                    );
-
-                    if (data.fatal) {
-
-                        switch (data.type) {
-
-                            case Hls.ErrorTypes.NETWORK_ERROR:
-
-                                console.log(
-                                    "Trying to recover network..."
-                                );
-
-                                hls.startLoad();
-                                break;
-
-                            case Hls.ErrorTypes.MEDIA_ERROR:
-
-                                console.log(
-                                    "Trying to recover media..."
-                                );
-
-                                hls.recoverMediaError();
-                                break;
-
-                            default:
-
-                                showError();
-                                break;
-                        }
+            return {
+                refresh: function () {
+                    items.forEach(function (item, i) { item.setAttribute("aria-checked", i === selected ? "true" : "false"); });
+                    items.forEach(function (item) { item.setAttribute("aria-disabled", switchable ? "false" : "true"); });
+                    if (tracks.length < 2) {
+                        row.setAttribute("aria-disabled", "true");
+                        row.classList.add("cv-audio-static");
+                        rowValue.textContent = tracks[0] ? (tracks[0].label || "Track 1") : "";
+                    } else {
+                        row.setAttribute("aria-disabled", "false");
+                        row.classList.remove("cv-audio-static");
+                        rowValue.textContent = selected >= 0 && tracks[selected]
+                            ? (tracks[selected].label || ("Track " + (selected + 1)))
+                            : (switchable ? "Select" : "");
                     }
-                }
-            );
-
-        } else if (
-            video.canPlayType(
-                "application/vnd.apple.mpegurl"
-            )
-        ) {
-
-            /*
-             * Safari / native HLS
-             */
-
-            video.src = masterUrl;
-
-            video.addEventListener(
-                "loadedmetadata",
-                function () {
-
-                    hideLoading();
-                    hideError();
                 },
-                {
-                    once: true
-                }
-            );
-
-        } else {
-
-            console.log(
-                "HLS is not supported."
-            );
-
-            showError();
+                note: function (message) { note.textContent = message || ""; }
+            };
         }
-    }
 
-    async function start() {
+        /* -------------------------------------------------------- applying a selection ---- */
 
-        showLoading();
+        function nativeAudioTracks() { return video.audioTracks && video.audioTracks.length ? video.audioTracks : null; }
 
-        hideError();
-
-        createPlyr();
-
-        connectAudioSelector();
-
-        /*
-         * Current page:
-         *
-         * /watch/123/file.mkv?hash=xxxx
-         *
-         * Convert to:
-         *
-         * /hls-start/123?hash=xxxx
-         */
-
-        const watchUrl =
-    new URL(window.location.href);
-
-const pathParts =
-    watchUrl.pathname.split("/");
-
-const watchIndex =
-    pathParts.indexOf("watch");
-
-const fileId =
-    watchIndex >= 0
-        ? pathParts[watchIndex + 1]
-        : null;
-
-const hash =
-    watchUrl.searchParams.get("hash");
-
-if (!fileId || !hash) {
-    throw new Error(
-        "File ID or hash missing"
-    );
-}
-
-const hlsStartUrl =
-    "/hls-start/" +
-    encodeURIComponent(fileId) +
-    "?hash=" +
-    encodeURIComponent(hash);
-		
-        console.log(
-            "HLS start URL:",
-            hlsStartUrl
-        );
-
-        try {
-
-            const response =
-                await fetch(
-                    hlsStartUrl,
-                    {
-                        method: "GET",
-                        cache: "no-store"
-                    }
-                );
-
-            if (!response.ok) {
-
-                throw new Error(
-                    "HLS start failed: " +
-                    response.status
-                );
-            }
-
-            const data =
-                await response.json();
-
-            if (
-                !data.master
-            ) {
-
-                throw new Error(
-                    "HLS master playlist missing"
-                );
-            }
-
-            console.log(
-                "HLS master:",
-                data.master
-            );
-
-            console.log(
-                "Audio tracks:",
-                data.audio_tracks
-            );
-
-            loadHLS(
-                data.master,
-                data.audio_tracks || []
-            );
-
-        } catch (error) {
-
-            console.error(
-                "HLS initialization failed:",
-                error
-            );
-
-            /*
-             * Fallback to original direct
-             * Telegram streaming URL.
-             */
-
-            console.log(
-                "Falling back to normal player..."
-            );
-
-            video.src =
-                "{{file_url}}";
-
-            video.load();
-
-            video.addEventListener(
-                "loadeddata",
-                hideLoading,
-                {
-                    once: true
-                }
-            );
-
-            video.addEventListener(
-                "error",
-                showError,
-                {
-                    once: true
-                }
-            );
+        function setSelected(i) {
+            selected = i;
+            if (ui) { ui.refresh(); }
         }
-    }
 
-    /*
-     * Start after DOM is ready.
-     */
+        function applyTrack(i) {
+            if (mode !== "hls") { return; }
+            if (hls) {
+                if (hls.audioTracks && hls.audioTracks[i]) { hls.audioTrack = i; }   // confirmed by AUDIO_TRACK_SWITCHED
+            } else {
+                var list = nativeAudioTracks();
+                if (!list) { return; }
+                for (var k = 0; k < list.length; k++) { list[k].enabled = (k === i); }
+                setSelected(i);
+            }
+        }
 
-    document.addEventListener(
-        "DOMContentLoaded",
-        start
-    );
+        function requestTrack(i) {
+            if (i === selected) { return; }
+            if (mode === "hls") { if (ui) { ui.note("Switching audio\u2026"); } applyTrack(i); return; }
+            wanted = i;
+            if (ui) { ui.note("Switching audio\u2026"); }
+            enterHls().then(function () { applyTrack(wanted); }).catch(giveUp);
+        }
 
-})();
-</script>
+        /* ------------------------------------------------------------ HLS playback ---- */
+
+        function detachHls() {
+            if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+        }
+
+        function backToDirect(position, playing) {
+            detachHls();
+            mode = "direct";
+            video.removeAttribute("src");
+            video.load();   // falls back to the original <source>
+            var restore = function () {
+                try { if (position > 0) { video.currentTime = position; } } catch (e) {}
+                if (playing) { var p = video.play(); if (p && p.catch) { p.catch(function () {}); } }
+            };
+            video.addEventListener("loadedmetadata", restore, { once: true });
+        }
+
+        function giveUp(error) {
+            var position = video.currentTime || 0;
+            var playing = !video.paused && !video.ended;
+            var wasHls = (mode === "hls");
+            if (wasHls) { backToDirect(position, playing); }
+            switchable = false;
+            selected = -1;
+            wanted = -1;
+            if (ui) {
+                ui.refresh();
+                ui.note(error && error.message ? error.message : "Audio switching is not available right now.");
+            }
+            if (window.console) { console.warn("Audio switching unavailable:", error && error.message); }
+        }
+
+        function attachHlsJs(info, position, playing) {
+            return new Promise(function (resolve, reject) {
+                hls = new Hls({ startPosition: position > 0 ? position : 0, enableWorker: true, backBufferLength: 90 });
+                var done = false;
+                var timer = setTimeout(function () { if (!done) { done = true; reject(new Error("The video player could not load the audio tracks.")); } }, 25000);
+
+                // hls.js fires MANIFEST_PARSED first and fills hls.audioTracks only afterwards (AUDIO_TRACKS_UPDATED)
+                hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, function () {
+                    if (done) { return; }
+                    done = true; clearTimeout(timer);
+                    if (!hls || !hls.audioTracks || hls.audioTracks.length < 2) { reject(new Error("The audio tracks could not be loaded.")); return; }
+                    mode = "hls";
+                    var shown = hls.audioTrack;
+                    setSelected(shown >= 0 ? shown : defaultIndex);
+                    if (playing) { var p = video.play(); if (p && p.catch) { p.catch(function () {}); } }
+                    resolve();
+                });
+                hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, function (event, data) {
+                    if (mode !== "hls") { return; }
+                    setSelected(data.id);          // the checkmark moves only when the switch really happened
+                    if (ui) { ui.note(""); }
+                });
+                hls.on(Hls.Events.ERROR, function (event, data) {
+                    if (!data || !data.fatal) { return; }
+                    if (!done) { done = true; clearTimeout(timer); reject(new Error("The video player could not start audio switching.")); return; }
+                    recover(data);
+                });
+                hls.loadSource(info.master);
+                hls.attachMedia(video);
+            });
+        }
+
+        function attachNative(info, position, playing) {
+            return new Promise(function (resolve, reject) {
+                video.src = info.master;
+                video.load();
+                var timer = setTimeout(function () { reject(new Error("The video player could not load the audio tracks.")); }, 25000);
+                video.addEventListener("loadedmetadata", function () {
+                    clearTimeout(timer);
+                    var list = nativeAudioTracks();
+                    if (!list || list.length < 2) { reject(new Error("The audio tracks could not be loaded.")); return; }
+                    mode = "hls";
+                    try { if (position > 0) { video.currentTime = position; } } catch (e) {}
+                    var current = defaultIndex;
+                    for (var k = 0; k < list.length; k++) { if (list[k].enabled) { current = k; } }
+                    setSelected(current);
+                    list.addEventListener("change", function () {
+                        for (var j = 0; j < list.length; j++) { if (list[j].enabled) { setSelected(j); } }
+                    });
+                    if (playing) { var p = video.play(); if (p && p.catch) { p.catch(function () {}); } }
+                    resolve();
+                }, { once: true });
+                video.addEventListener("error", function () { clearTimeout(timer); reject(new Error("The video player could not load the audio tracks.")); }, { once: true });
+            });
+        }
+
+        function enterHls() {
+            if (mode === "hls") { return Promise.resolve(); }
+            return ensureHls().then(function (info) {
+                var position = video.currentTime || 0;
+                var playing = !video.paused && !video.ended;
+                var native = !!video.canPlayType("application/vnd.apple.mpegurl") && typeof video.audioTracks !== "undefined";
+                if (native) { return attachNative(info, position, playing); }
+                if (window.Hls && Hls.isSupported()) { return attachHlsJs(info, position, playing); }
+                throw new Error("This browser cannot switch audio tracks.");
+            });
+        }
+
+        /* A fatal playback error: retry (network/media) and, if the server already cleaned the job up, start it again. */
+        function recover(data) {
+            recoverCount += 1;
+            if (recoverCount > 4) { giveUp(new Error("Audio switching stopped working. Playback continues with the original audio.")); return; }
+            var position = video.currentTime || 0;
+            var playing = !video.paused && !video.ended;
+            var code = data && data.response && data.response.code;
+            if (data && data.type === Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); return; }
+            if (code === 404 || code === 403) {
+                detachHls(); mode = "direct"; hlsInfo = null;
+                enterHlsAt(position, playing).catch(giveUp);
+                return;
+            }
+            if (data && data.type === Hls.ErrorTypes.NETWORK_ERROR) { hls.startLoad(); return; }
+            giveUp(new Error("Audio switching stopped working. Playback continues with the original audio."));
+        }
+
+        function enterHlsAt(position, playing) {
+            return ensureHls().then(function (info) { return attachHlsJs(info, position, playing); }).then(function () { applyTrack(selected); });
+        }
+
+        /* ---------------------------------------------------------------- start ---- */
+
+        function init() {
+            getJson("/audio-info/" + query()).then(function (r) {
+                var list = r.data && r.data.audio_tracks;
+                if (!r.ok || !list || !list.length) { return; }      // no tracks / not a video: nothing to show
+                tracks = list;
+                tracks.forEach(function (t, i) { if (t["default"]) { defaultIndex = i; } });
+                ui = buildMenu();
+                if (!ui) { return; }
+
+                if (tracks.length === 1) {
+                    selected = 0;                                     // one track: it is the one playing
+                    ui.refresh();
+                    return;
+                }
+                var hlsOk = r.data.hls && r.data.hls.available;
+                if (!hlsOk) {
+                    ui.refresh();
+                    ui.note((r.data.hls && r.data.hls.reason) || "Audio switching is not available for this file.");
+                    return;
+                }
+                switchable = true;
+                ui.refresh();
+                if (r.data.hls.autostart) {
+                    ui.note("Preparing audio tracks\u2026");
+                    enterHls().then(function () { if (ui) { ui.note(""); } }).catch(giveUp);
+                }
+            }).catch(function () { /* detection failed: the normal player keeps working */ });
+        }
+
+        function whenPlayerReady() {
+            player = window.cvPlayer;
+            if (!player) { return setTimeout(whenPlayerReady, 150); }
+            if (player.elements && player.elements.settings && player.elements.settings.panels && player.elements.settings.panels.home) { init(); }
+            else { player.once("ready", init); }
+        }
+
+        document.addEventListener("DOMContentLoaded", whenPlayerReady);
+    })();
+    </script>
     <!-- iterate animation -->
 
 
