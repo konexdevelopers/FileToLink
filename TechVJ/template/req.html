@@ -107,6 +107,8 @@ a{color:inherit}
 .cv-audio-note{margin:0;padding:2px 14px 10px;font-size:12.5px;line-height:1.4;opacity:.8}
 .cv-audio-note:empty{display:none}
 .cv-audio-list [aria-disabled="true"]{opacity:.55;cursor:not-allowed}
+.cv-audio-toast{position:absolute;left:12px;bottom:68px;z-index:7;max-width:calc(100% - 24px);padding:8px 12px;border-radius:12px;background:rgba(7,7,10,.9);border:1px solid rgba(229,36,47,.55);color:#fff;font-size:13px;line-height:1.35;pointer-events:none;opacity:0;transition:opacity .2s ease}
+.cv-audio-toast.is-on{opacity:1}
 @media (min-width:640px){.cv-apps{grid-template-columns:repeat(3,minmax(0,1fr))}.cv-dlwrap{justify-content:start}.cv-dl{padding:0 34px}}
 @media (min-width:1000px){.cv-frame{padding:1.5px}}
 </style>
@@ -272,19 +274,43 @@ a{color:inherit}
         var HASH = "{{secure_hash}}";
         var video = document.getElementById("player");
         if (!video || !window.fetch) { return; }
+        if (window.__cvAudioController) { return; }      // never initialise twice (no duplicate listeners / instances)
+        window.__cvAudioController = true;
 
-        var player = null;
-        var tracks = [];            // real tracks reported by the server
-        var defaultIndex = 0;
-        var selected = -1;          // track that is ACTUALLY playing (-1 = unknown / not switchable yet)
-        var wanted = -1;            // track the viewer asked for while HLS is still starting
-        var mode = "direct";        // "direct" (original file) | "hls"
-        var hls = null;
-        var hlsInfo = null;
-        var starting = null;
-        var switchable = false;
-        var recoverCount = 0;
-        var ui = null;
+        var SWITCH_TIMEOUT_MS = 12000;
+        var COVERAGE_WAIT_MS = 120000;     // how long we keep watching the original file while HLS catches up
+        var COVERAGE_MARGIN_S = 8;
+
+        /* ONE source of truth. The dot in the menu is drawn from `active` only, and `active` is only ever
+           written from what the player itself reports (hls.js AUDIO_TRACK_SWITCHED / native audioTracks). */
+        var state = {
+            tracks: [],          // real tracks from /audio-info (same order as master.m3u8)
+            defaultIndex: 0,
+            mode: "direct",      // "direct" (original file) | "hls"
+            backend: null,       // "hlsjs" | "native"
+            hls: null,
+            handlers: [],        // [event, fn] pairs registered on the current hls.js instance (removed on detach)
+            nativeList: null,
+            nativeHandler: null,
+            map: [],             // map[uiIndex] = REAL hls.js audio-track id (-1 if it cannot be matched)
+            active: -1,          // UI index of the track that is REALLY playing (-1 = unknown yet)
+            requested: -1,       // UI index the viewer asked for last
+            pendingId: null,     // hls.js id we already asked for and are still waiting on
+            holdNote: false,     // keep a failure message visible until the viewer acts again
+            hlsInfo: null,
+            startPromise: null,
+            enterPromise: null,
+            switchTimer: null,
+            switchable: false,
+            recoverCount: 0,
+            ui: null
+        };
+
+        function log() {
+            // labels and indexes only: never URLs, hashes or tokens
+            try { console.log.apply(console, ["[Audio]"].concat(Array.prototype.slice.call(arguments))); } catch (e) {}
+        }
+        function label(i) { return state.tracks[i] ? (state.tracks[i].label || ("Track " + (i + 1))) : "?"; }
 
         /* ------------------------------------------------------------ server calls ---- */
 
@@ -298,21 +324,21 @@ a{color:inherit}
 
         function query() { return FILE_ID + "?hash=" + encodeURIComponent(HASH); }
 
-        function ensureHls() {
-            if (hlsInfo) { return Promise.resolve(hlsInfo); }
-            if (starting) { return starting; }
-            if (ui) { ui.note("Preparing audio tracks\u2026"); }
-            starting = getJson("/hls-start/" + query()).then(function (r) {
+        /* single flight: autostart and any number of clicks share ONE /hls-start request */
+        function startHls() {
+            if (state.hlsInfo) { return Promise.resolve(state.hlsInfo); }
+            if (state.startPromise) { return state.startPromise; }
+            if (state.ui) { state.ui.note("Preparing audio tracks\u2026"); }
+            state.startPromise = getJson("/hls-start/" + query()).then(function (r) {
                 if (!r.ok || r.data.status !== "ok" || !r.data.master) {
                     var error = new Error(r.data.message || "Audio switching is not available");
                     error.code = r.data.code;
                     throw error;
                 }
-                hlsInfo = r.data;
-                return hlsInfo;
-            });
-            starting = starting.then(function (v) { starting = null; return v; }, function (e) { starting = null; throw e; });
-            return starting;
+                state.hlsInfo = r.data;
+                return state.hlsInfo;
+            }).then(function (v) { state.startPromise = null; return v; }, function (e) { state.startPromise = null; throw e; });
+            return state.startPromise;
         }
 
         /* --------------------------------------------------- Plyr "Audio" settings menu ---- */
@@ -324,7 +350,7 @@ a{color:inherit}
             return node;
         }
 
-        function buildMenu() {
+        function buildMenu(player) {
             var s = player && player.elements && player.elements.settings;
             var home = s && s.panels && s.panels.home;
             if (!home) { return null; }
@@ -360,9 +386,9 @@ a{color:inherit}
             pane.addEventListener("keydown", function (e) {
                 if (e.key === "ArrowLeft") { e.preventDefault(); e.stopPropagation(); show(home); }
                 else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-                    var items = Array.prototype.slice.call(list.querySelectorAll('[role="menuitemradio"]'));
-                    var at = items.indexOf(document.activeElement);
-                    var next = items[(at + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length];
+                    var all = Array.prototype.slice.call(list.querySelectorAll('[role="menuitemradio"]'));
+                    var at = all.indexOf(document.activeElement);
+                    var next = all[(at + (e.key === "ArrowDown" ? 1 : all.length - 1)) % all.length];
                     if (next) { e.preventDefault(); next.focus(); }
                 }
             });
@@ -371,15 +397,16 @@ a{color:inherit}
             });
 
             var items = [];
-            tracks.forEach(function (track, i) {
+            state.tracks.forEach(function (track, i) {
                 var item = el("button", { type: "button", "class": "plyr__control", role: "menuitemradio", "aria-checked": "false", value: String(i) });
-                item.appendChild(el("span", {}, track.label || ("Track " + (i + 1))));
+                item.appendChild(el("span", {}, label(i)));
                 if (track.channels > 2 || (track.channel_layout && /\d\.\d/.test(track.channel_layout))) {
                     item.title = track.channel_layout || (track.channels + " channels");
                 }
                 item.addEventListener("click", function (e) {
                     e.preventDefault(); e.stopPropagation();
                     if (item.getAttribute("aria-disabled") === "true") { return; }
+                    log("User selected:", label(i));
                     requestTrack(i);
                     show(home);
                 });
@@ -389,111 +416,221 @@ a{color:inherit}
 
             return {
                 refresh: function () {
-                    items.forEach(function (item, i) { item.setAttribute("aria-checked", i === selected ? "true" : "false"); });
-                    items.forEach(function (item) { item.setAttribute("aria-disabled", switchable ? "false" : "true"); });
-                    if (tracks.length < 2) {
+                    items.forEach(function (item, i) {
+                        item.setAttribute("aria-checked", i === state.active ? "true" : "false");   // the dot = the REAL active track
+                        var usable = state.switchable && (state.mode !== "hls" || state.backend !== "hlsjs" || state.map[i] >= 0);
+                        item.setAttribute("aria-disabled", usable ? "false" : "true");
+                    });
+                    if (state.tracks.length < 2) {
                         row.setAttribute("aria-disabled", "true");
                         row.classList.add("cv-audio-static");
-                        rowValue.textContent = tracks[0] ? (tracks[0].label || "Track 1") : "";
+                        rowValue.textContent = state.tracks[0] ? label(0) : "";
                     } else {
                         row.setAttribute("aria-disabled", "false");
                         row.classList.remove("cv-audio-static");
-                        rowValue.textContent = selected >= 0 && tracks[selected]
-                            ? (tracks[selected].label || ("Track " + (selected + 1)))
-                            : (switchable ? "Select" : "");
+                        rowValue.textContent = state.active >= 0 ? label(state.active) : (state.switchable ? "Preparing\u2026" : "");
                     }
                 },
                 note: function (message) { note.textContent = message || ""; }
             };
         }
 
-        /* -------------------------------------------------------- applying a selection ---- */
+        function refresh() { if (state.ui) { state.ui.refresh(); } }
+        function note(message) { if (state.ui) { state.ui.note(message); } }
 
-        function nativeAudioTracks() { return video.audioTracks && video.audioTracks.length ? video.audioTracks : null; }
-
-        function setSelected(i) {
-            selected = i;
-            if (ui) { ui.refresh(); }
+        /* small, non-blocking message over the player (the Audio menu closes after a click, so a note alone would be missed) */
+        var toastEl = null, toastTimer = null;
+        function toast(message) {
+            try {
+                var host = video.closest(".cv-player") || video.parentNode;
+                if (!toastEl) { toastEl = el("div", { "class": "cv-audio-toast", role: "status", "aria-live": "polite" }); host.appendChild(toastEl); }
+                toastEl.textContent = message;
+                toastEl.classList.add("is-on");
+                clearTimeout(toastTimer);
+                toastTimer = setTimeout(function () { toastEl.classList.remove("is-on"); }, 6000);
+            } catch (e) {}
         }
 
-        function applyTrack(i) {
-            if (mode !== "hls") { return; }
-            if (hls) {
-                if (hls.audioTracks && hls.audioTracks[i]) { hls.audioTrack = i; }   // confirmed by AUDIO_TRACK_SWITCHED
-            } else {
-                var list = nativeAudioTracks();
-                if (!list) { return; }
-                for (var k = 0; k < list.length; k++) { list[k].enabled = (k === i); }
-                setSelected(i);
+        /* ---------------------------------------------------------- real track state ---- */
+
+        /* The player reports which track is REALLY active: only then does the dot move. */
+        function onActual(uiIndex) {
+            if (uiIndex < 0) { return; }
+            state.active = uiIndex;
+            state.recoverCount = 0;
+            if (state.map[uiIndex] === state.pendingId) { state.pendingId = null; }
+            log("AUDIO_TRACK_SWITCHED:", uiIndex, label(uiIndex));
+            log("Active track:", label(uiIndex));
+            if (state.requested < 0 || state.requested === state.active) {
+                state.requested = state.active;
+                clearTimeout(state.switchTimer);
+                if (!state.holdNote) { note(""); }
+            }
+            refresh();
+        }
+
+        /* hls.js id -> UI index, using the REAL hls.audioTracks (never assuming both lists use the same order) */
+        function buildMap(hls) {
+            var real = hls.audioTracks || [];
+            var used = {};
+            var map = [];
+            state.tracks.forEach(function (track, i) {
+                var found = -1;
+                for (var j = 0; j < real.length; j++) {
+                    if (!used[j] && real[j].name === label(i)) { found = j; break; }
+                }
+                if (found < 0 && real.length === state.tracks.length && !used[i]) { found = i; }
+                if (found >= 0) { used[found] = true; }
+                map.push(found >= 0 ? real[found].id : -1);
+            });
+            state.map = map;
+            log("Available tracks:", real.map(function (t) { return (t.id + ":" + t.name + (t.lang ? "/" + t.lang : "") + (t["default"] ? " (default)" : "")); }));
+        }
+
+        function uiIndexForHlsId(id) { return state.map.indexOf(id); }
+
+        function armSwitchTimer() {
+            clearTimeout(state.switchTimer);
+            state.switchTimer = setTimeout(function () {
+                if (state.requested < 0 || state.requested === state.active) { return; }
+                // The switch never completed: keep the dot on the real (previous) track and say so
+                log("Switch to", label(state.requested), "did not complete; staying on", state.active >= 0 ? label(state.active) : "the current track");
+                var previous = state.active;
+                state.requested = previous;
+                state.pendingId = null;
+                if (state.hls && previous >= 0 && state.map[previous] >= 0) { try { state.hls.audioTrack = state.map[previous]; } catch (e) {} }
+                note("Couldn't switch the audio track. Still on " + (previous >= 0 ? label(previous) : "the original audio") + ".");
+                state.holdNote = true;               // the revert itself fires AUDIO_TRACK_SWITCHED: do not wipe the message
+                toast("Couldn't switch the audio track. Still on " + (previous >= 0 ? label(previous) : "the original audio") + ".");
+                refresh();
+            }, SWITCH_TIMEOUT_MS);
+        }
+
+        /* ----------------------------------------------------------- applying a choice ---- */
+
+        function nativeTracks() { return video.audioTracks && video.audioTracks.length ? video.audioTracks : null; }
+
+        function syncNative() {
+            var list = state.nativeList;
+            if (!list) { return; }
+            for (var k = 0; k < list.length; k++) { if (list[k].enabled) { onActual(k); return; } }
+        }
+
+        function applyTrack(ui) {
+            if (state.mode !== "hls") { return; }
+            state.requested = ui;
+            if (state.backend === "hlsjs" && state.hls) {
+                var id = state.map[ui];
+                if (id === undefined || id < 0) { note("That audio track isn't available."); state.requested = state.active; return; }
+                if (state.pendingId === id) { return; }          // already asked for this exact track: do not ask twice
+                state.pendingId = id;
+                log("Requested track index:", id);
+                state.hls.audioTrack = id;           // switches the REAL rendition; the dot waits for AUDIO_TRACK_SWITCHED
+                armSwitchTimer();
+            } else if (state.backend === "native" && state.nativeList) {
+                var list = state.nativeList;
+                log("Requested track index:", ui);
+                for (var k = 0; k < list.length; k++) { list[k].enabled = (k === ui); }
+                syncNative();                        // read back what the browser really enabled
             }
         }
 
-        function requestTrack(i) {
-            if (i === selected) { return; }
-            if (mode === "hls") { if (ui) { ui.note("Switching audio\u2026"); } applyTrack(i); return; }
-            wanted = i;
-            if (ui) { ui.note("Switching audio\u2026"); }
-            enterHls().then(function () { applyTrack(wanted); }).catch(giveUp);
+        function requestTrack(ui) {
+            state.holdNote = false;                    // a new action: the old failure message may go
+            if (ui === state.requested && (ui === state.active || state.mode === "hls")) { return; }   // already active, or already being switched to
+            state.requested = ui;
+            if (state.mode === "hls") { note("Switching audio\u2026"); applyTrack(ui); return; }
+            // HLS is not running yet: remember the LAST choice and apply it once (no matter how many clicks)
+            note("Switching audio\u2026");
+            enterHls().then(function () {
+                if (state.requested >= 0 && state.requested !== state.active) { applyTrack(state.requested); }
+            }).catch(giveUp);
         }
 
         /* ------------------------------------------------------------ HLS playback ---- */
 
         function detachHls() {
-            if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+            clearTimeout(state.switchTimer);
+            if (state.hls) {
+                state.handlers.forEach(function (h) { try { state.hls.off(h[0], h[1]); } catch (e) {} });
+                try { state.hls.destroy(); } catch (e) {}
+            }
+            state.hls = null;
+            state.handlers = [];
+            state.pendingId = null;
+            if (state.nativeList && state.nativeHandler) {
+                try { state.nativeList.removeEventListener("change", state.nativeHandler); } catch (e) {}
+            }
+            state.nativeList = null;
+            state.nativeHandler = null;
         }
 
-        function backToDirect(position, playing) {
-            detachHls();
-            mode = "direct";
-            video.removeAttribute("src");
-            video.load();   // falls back to the original <source>
+        function resume(position, playing) {
             var restore = function () {
                 try { if (position > 0) { video.currentTime = position; } } catch (e) {}
                 if (playing) { var p = video.play(); if (p && p.catch) { p.catch(function () {}); } }
             };
-            video.addEventListener("loadedmetadata", restore, { once: true });
+            if (video.readyState >= 1) { restore(); } else { video.addEventListener("loadedmetadata", restore, { once: true }); }
+        }
+
+        function backToDirect(position, playing) {
+            detachHls();
+            state.mode = "direct";
+            state.backend = null;
+            video.removeAttribute("src");
+            video.load();   // falls back to the original <source>
+            resume(position, playing);
         }
 
         function giveUp(error) {
             var position = video.currentTime || 0;
             var playing = !video.paused && !video.ended;
-            var wasHls = (mode === "hls");
-            if (wasHls) { backToDirect(position, playing); }
-            switchable = false;
-            selected = -1;
-            wanted = -1;
-            if (ui) {
-                ui.refresh();
-                ui.note(error && error.message ? error.message : "Audio switching is not available right now.");
-            }
-            if (window.console) { console.warn("Audio switching unavailable:", error && error.message); }
+            if (state.mode === "hls") { backToDirect(position, playing); }
+            clearTimeout(state.switchTimer);
+            state.switchable = false;
+            state.active = -1;
+            state.requested = -1;
+            note(error && error.message ? error.message : "Audio switching is not available right now.");
+            toast(error && error.message ? error.message : "Audio switching is not available right now.");
+            refresh();
+            log("Audio switching unavailable:", error && error.message);
         }
 
         function attachHlsJs(info, position, playing) {
-            return new Promise(function (resolve, reject) {
-                hls = new Hls({ startPosition: position > 0 ? position : 0, enableWorker: true, backBufferLength: 90 });
-                var done = false;
-                var timer = setTimeout(function () { if (!done) { done = true; reject(new Error("The video player could not load the audio tracks.")); } }, 25000);
+            detachHls();                                   // there is never more than one hls.js instance
+            var hls = new Hls({ startPosition: position > 0 ? position : 0, enableWorker: true, backBufferLength: 90 });
+            state.hls = hls;
+            state.handlers = [];
+            function on(ev, fn) { hls.on(ev, fn); state.handlers.push([ev, fn]); }
 
-                // hls.js fires MANIFEST_PARSED first and fills hls.audioTracks only afterwards (AUDIO_TRACKS_UPDATED)
-                hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, function () {
-                    if (done) { return; }
-                    done = true; clearTimeout(timer);
-                    if (!hls || !hls.audioTracks || hls.audioTracks.length < 2) { reject(new Error("The audio tracks could not be loaded.")); return; }
-                    mode = "hls";
-                    var shown = hls.audioTrack;
-                    setSelected(shown >= 0 ? shown : defaultIndex);
-                    if (playing) { var p = video.play(); if (p && p.catch) { p.catch(function () {}); } }
-                    resolve();
+            return new Promise(function (resolve, reject) {
+                var settled = false;
+                var timer = setTimeout(function () { fail(new Error("The video player could not load the audio tracks.")); }, 25000);
+                function fail(error) { if (settled) { return; } settled = true; clearTimeout(timer); reject(error); }
+
+                // hls.js fires MANIFEST_PARSED first and fills hls.audioTracks only afterwards
+                on(Hls.Events.AUDIO_TRACKS_UPDATED, function () {
+                    if (hls !== state.hls) { return; }
+                    buildMap(hls);
+                    if (!settled) {
+                        settled = true; clearTimeout(timer);
+                        if (state.map.length < 2 || hls.audioTracks.length < 2) { reject(new Error("The audio tracks could not be loaded.")); return; }
+                        state.mode = "hls";
+                        state.backend = "hlsjs";
+                        if (playing) { var p = video.play(); if (p && p.catch) { p.catch(function () {}); } }
+                        resolve();
+                    } else if (hls.audioTrack >= 0 && uiIndexForHlsId(hls.audioTrack) >= 0 && state.active < 0) {
+                        onActual(uiIndexForHlsId(hls.audioTrack));
+                    }
+                    refresh();
                 });
-                hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, function (event, data) {
-                    if (mode !== "hls") { return; }
-                    setSelected(data.id);          // the checkmark moves only when the switch really happened
-                    if (ui) { ui.note(""); }
+                on(Hls.Events.AUDIO_TRACK_SWITCHED, function (event, data) {
+                    if (hls !== state.hls || state.mode !== "hls") { return; }
+                    onActual(uiIndexForHlsId(data.id));
                 });
-                hls.on(Hls.Events.ERROR, function (event, data) {
-                    if (!data || !data.fatal) { return; }
-                    if (!done) { done = true; clearTimeout(timer); reject(new Error("The video player could not start audio switching.")); return; }
+                on(Hls.Events.ERROR, function (event, data) {
+                    if (hls !== state.hls || !data || !data.fatal) { return; }
+                    if (!settled) { fail(new Error("The video player could not start audio switching.")); return; }
                     recover(data);
                 });
                 hls.loadSource(info.master);
@@ -502,60 +639,112 @@ a{color:inherit}
         }
 
         function attachNative(info, position, playing) {
+            detachHls();
             return new Promise(function (resolve, reject) {
+                var done = false;
+                var timer = setTimeout(function () { finish(new Error("The video player could not load the audio tracks.")); }, 25000);
+                function finish(error) {
+                    if (done) { return; }
+                    done = true; clearTimeout(timer);
+                    if (error) { reject(error); return; }
+                    resolve();
+                }
+                function ready() {
+                    var list = nativeTracks();
+                    if (done || !list || list.length < 2) { return; }
+                    state.nativeList = list;
+                    state.nativeHandler = function () { syncNative(); };
+                    list.addEventListener("change", state.nativeHandler);
+                    state.mode = "hls";
+                    state.backend = "native";
+                    state.map = state.tracks.map(function (t, i) { return i; });
+                    log("Available tracks:", Array.prototype.map.call(list, function (t, i) { return i + ":" + (t.label || ("Track " + (i + 1))); }));
+                    resume(position, playing);
+                    syncNative();
+                    refresh();
+                    finish();
+                }
                 video.src = info.master;
                 video.load();
-                var timer = setTimeout(function () { reject(new Error("The video player could not load the audio tracks.")); }, 25000);
-                video.addEventListener("loadedmetadata", function () {
-                    clearTimeout(timer);
-                    var list = nativeAudioTracks();
-                    if (!list || list.length < 2) { reject(new Error("The audio tracks could not be loaded.")); return; }
-                    mode = "hls";
-                    try { if (position > 0) { video.currentTime = position; } } catch (e) {}
-                    var current = defaultIndex;
-                    for (var k = 0; k < list.length; k++) { if (list[k].enabled) { current = k; } }
-                    setSelected(current);
-                    list.addEventListener("change", function () {
-                        for (var j = 0; j < list.length; j++) { if (list[j].enabled) { setSelected(j); } }
-                    });
-                    if (playing) { var p = video.play(); if (p && p.catch) { p.catch(function () {}); } }
-                    resolve();
-                }, { once: true });
-                video.addEventListener("error", function () { clearTimeout(timer); reject(new Error("The video player could not load the audio tracks.")); }, { once: true });
+                video.addEventListener("loadedmetadata", function onMeta() {
+                    video.removeEventListener("loadedmetadata", onMeta);
+                    ready();
+                    if (!done) {                                    // Safari fills audioTracks a moment later
+                        var tries = 0;
+                        var poll = setInterval(function () { tries += 1; ready(); if (done || tries > 40) { clearInterval(poll); } }, 250);
+                    }
+                });
+                video.addEventListener("error", function () { finish(new Error("The video player could not load the audio tracks.")); }, { once: true });
             });
         }
 
+        /* HLS is generated while the viewer already watches the original file. Swapping before the playlists
+           reach the viewer's position would stall the video, so keep playing the original until they have. */
+        function playlistCoverage(url) {
+            return fetch(url, { cache: "no-store", credentials: "same-origin" }).then(function (r) {
+                if (!r.ok) { throw new Error("playlist"); }
+                return r.text();
+            }).then(function (text) {
+                var total = 0, m, re = /#EXTINF:([\d.]+)/g;
+                while ((m = re.exec(text))) { total += parseFloat(m[1]); }
+                return { seconds: total, ended: text.indexOf("#EXT-X-ENDLIST") >= 0 };
+            });
+        }
+
+        function waitForCoverage(info) {
+            var base = info.master.replace(/master\.m3u8$/, "");
+            var names = ["video.m3u8"];
+            for (var i = 0; i < state.tracks.length; i++) { names.push("audio_" + i + ".m3u8"); }
+            var deadline = Date.now() + COVERAGE_WAIT_MS;
+            return new Promise(function (resolve, reject) {
+                (function check() {
+                    var position = video.currentTime || 0;
+                    var need = position > 1 ? position + COVERAGE_MARGIN_S : 0;      // not started yet: the first segments are enough
+                    Promise.all(names.map(function (n) { return playlistCoverage(base + n); })).then(function (list) {
+                        var covered = list.every(function (c) { return c.ended || c.seconds >= need; });
+                        if (covered) { resolve(info); return; }
+                        if (Date.now() > deadline) { reject(new Error("The audio tracks are still being prepared for this part of the video.")); return; }
+                        setTimeout(check, 1500);
+                    }).catch(reject);
+                })();
+            });
+        }
+
+        /* single flight: the autostart and every click share ONE attach (no second hls.js instance) */
         function enterHls() {
-            if (mode === "hls") { return Promise.resolve(); }
-            return ensureHls().then(function (info) {
+            if (state.mode === "hls") { return Promise.resolve(); }
+            if (state.enterPromise) { return state.enterPromise; }
+            state.enterPromise = startHls().then(waitForCoverage).then(function (info) {
                 var position = video.currentTime || 0;
                 var playing = !video.paused && !video.ended;
                 var native = !!video.canPlayType("application/vnd.apple.mpegurl") && typeof video.audioTracks !== "undefined";
                 if (native) { return attachNative(info, position, playing); }
                 if (window.Hls && Hls.isSupported()) { return attachHlsJs(info, position, playing); }
                 throw new Error("This browser cannot switch audio tracks.");
-            });
+            }).then(function () { state.enterPromise = null; }, function (e) { state.enterPromise = null; throw e; });
+            return state.enterPromise;
         }
 
-        /* A fatal playback error: retry (network/media) and, if the server already cleaned the job up, start it again. */
+        /* A fatal playback error: retry (network/media); if the server already cleaned the job up, start it again. */
         function recover(data) {
-            recoverCount += 1;
-            if (recoverCount > 4) { giveUp(new Error("Audio switching stopped working. Playback continues with the original audio.")); return; }
+            state.recoverCount += 1;
+            if (state.recoverCount > 4) { giveUp(new Error("Audio switching stopped working. Playback continues with the original audio.")); return; }
             var position = video.currentTime || 0;
             var playing = !video.paused && !video.ended;
             var code = data && data.response && data.response.code;
-            if (data && data.type === Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); return; }
+            if (data && data.type === Hls.ErrorTypes.MEDIA_ERROR) { state.hls.recoverMediaError(); return; }
             if (code === 404 || code === 403) {
-                detachHls(); mode = "direct"; hlsInfo = null;
-                enterHlsAt(position, playing).catch(giveUp);
+                var wanted = state.requested >= 0 ? state.requested : state.active;
+                detachHls(); state.mode = "direct"; state.backend = null; state.hlsInfo = null; state.active = -1;
+                state.requested = wanted;
+                enterHls().then(function () {
+                    resume(position, playing);
+                    if (state.requested >= 0 && state.requested !== state.active) { applyTrack(state.requested); }
+                }).catch(giveUp);
                 return;
             }
-            if (data && data.type === Hls.ErrorTypes.NETWORK_ERROR) { hls.startLoad(); return; }
+            if (data && data.type === Hls.ErrorTypes.NETWORK_ERROR) { state.hls.startLoad(); return; }
             giveUp(new Error("Audio switching stopped working. Playback continues with the original audio."));
-        }
-
-        function enterHlsAt(position, playing) {
-            return ensureHls().then(function (info) { return attachHlsJs(info, position, playing); }).then(function () { applyTrack(selected); });
         }
 
         /* ---------------------------------------------------------------- start ---- */
@@ -564,41 +753,48 @@ a{color:inherit}
             getJson("/audio-info/" + query()).then(function (r) {
                 var list = r.data && r.data.audio_tracks;
                 if (!r.ok || !list || !list.length) { return; }      // no tracks / not a video: nothing to show
-                tracks = list;
-                tracks.forEach(function (t, i) { if (t["default"]) { defaultIndex = i; } });
-                ui = buildMenu();
-                if (!ui) { return; }
+                state.tracks = list;
+                list.forEach(function (t, i) { if (t["default"]) { state.defaultIndex = i; } });
+                state.ui = buildMenu(window.cvPlayer);
+                if (!state.ui) { return; }
+                log("Available tracks:", list.map(function (t, i) { return i + ":" + (t.label || ("Track " + (i + 1))); }));
 
-                if (tracks.length === 1) {
-                    selected = 0;                                     // one track: it is the one playing
-                    ui.refresh();
+                if (list.length === 1) {
+                    state.active = 0;                                 // one track: it is the one playing
+                    refresh();
                     return;
                 }
                 var hlsOk = r.data.hls && r.data.hls.available;
                 if (!hlsOk) {
-                    ui.refresh();
-                    ui.note((r.data.hls && r.data.hls.reason) || "Audio switching is not available for this file.");
+                    refresh();
+                    note((r.data.hls && r.data.hls.reason) || "Audio switching is not available for this file.");
                     return;
                 }
-                switchable = true;
-                ui.refresh();
+                state.switchable = true;
+                refresh();
                 if (r.data.hls.autostart) {
-                    ui.note("Preparing audio tracks\u2026");
-                    enterHls().then(function () { if (ui) { ui.note(""); } }).catch(giveUp);
+                    note("Preparing audio tracks\u2026");
+                    enterHls().then(function () {
+                        if (state.requested >= 0 && state.requested !== state.active) { applyTrack(state.requested); }
+                        else { note(""); }
+                    }).catch(giveUp);
                 }
             }).catch(function () { /* detection failed: the normal player keeps working */ });
         }
 
+        var inited = false;
         function whenPlayerReady() {
-            player = window.cvPlayer;
+            var player = window.cvPlayer;
             if (!player) { return setTimeout(whenPlayerReady, 150); }
-            if (player.elements && player.elements.settings && player.elements.settings.panels && player.elements.settings.panels.home) { init(); }
-            else { player.once("ready", init); }
+            var ready = player.elements && player.elements.settings && player.elements.settings.panels && player.elements.settings.panels.home;
+            if (ready) { if (!inited) { inited = true; init(); } }
+            else { player.once("ready", function () { if (!inited) { inited = true; init(); } }); }
         }
 
         document.addEventListener("DOMContentLoaded", whenPlayerReady);
     })();
     </script>
+
     <!-- iterate animation -->
 
 
