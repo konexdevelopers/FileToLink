@@ -78,6 +78,7 @@ class HlsConfig:
     idle_ttl: int
     max_runtime: int
     start_timeout: int
+    request_wait: int
     segment_seconds: int
     max_cache_bytes: int
     min_free_bytes: int
@@ -111,7 +112,9 @@ def load_config() -> HlsConfig:
         max_jobs=max(1, env_int("HLS_MAX_JOBS", 2)),
         idle_ttl=max(60, env_int("HLS_IDLE_TTL", 900)),
         max_runtime=max(300, env_int("HLS_MAX_RUNTIME", 3 * 3600)),
-        start_timeout=max(15, env_int("HLS_START_TIMEOUT", 75)),
+        start_timeout=max(15, env_int("HLS_START_TIMEOUT", 150)),
+        # how long ONE /hls-start request may stay open (must stay below the host/proxy request timeout)
+        request_wait=min(40, max(1, env_int("HLS_REQUEST_WAIT", 20))),
         segment_seconds=min(10, max(2, env_int("HLS_SEGMENT_SECONDS", 4))),
         max_cache_bytes=max(256, env_int("HLS_MAX_CACHE_MB", 6144)) * 1024 * 1024,
         min_free_bytes=max(0, env_int("HLS_MIN_FREE_MB", 1024)) * 1024 * 1024,
@@ -341,6 +344,9 @@ class HlsJob:
     paused: bool = False
     stderr_tail: Deque[str] = field(default_factory=lambda: collections.deque(maxlen=30))
     tasks: List[asyncio.Task] = field(default_factory=list)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    start_error: Optional[Exception] = None
+    starter: Optional[asyncio.Task] = None
 
     @property
     def master_path(self) -> Path:
@@ -477,52 +483,84 @@ class HlsManager:
 
     async def get_or_start(
         self, file_id: int, secure_hash: str, source_url: str, probe: mp.ProbeResult, file_size: int,
+        wait: Optional[float] = None,
     ) -> HlsJob:
+        """
+        Starts (or reuses) the job and waits at most `wait` seconds for the first segments.
+        If it is not ready by then the job keeps preparing in the background and is returned with
+        state "starting"; the caller answers "preparing" and the page asks again. This keeps every
+        single HTTP request short, so a host/proxy request timeout can never cut it off.
+        """
+        wait = self.cfg.request_wait if wait is None else wait
         lock = self._locks.setdefault(file_id, asyncio.Lock())
         async with lock:
             job = self.jobs.get(file_id)
-            if job:
-                if job.state in ("running", "complete") and job.master_path.exists():
-                    job.touch()
-                    return job
-                await self._drop(file_id, "stale")
+            if job and job.state in ("running", "complete") and job.master_path.exists():
+                job.touch()
+                return job
+            if job and job.state == "starting":
+                job.touch()  # already preparing: just wait for it, never start a second FFmpeg
+            else:
+                if job:
+                    await self._drop(file_id, "stale")
 
-            failed = self._failures.get(file_id)
-            if failed and time.monotonic() - failed[0] < 30:
-                raise failed[1]  # do not hammer FFmpeg for a file that just failed
+                failed = self._failures.get(file_id)
+                if failed and time.monotonic() - failed[0] < 30:
+                    raise failed[1]  # do not hammer FFmpeg for a file that just failed
 
-            plan = self.plan(probe, file_size)
-            if not plan["available"]:
-                code, message = plan["problem"]
-                raise HlsError(code, message, 422)
+                plan = self.plan(probe, file_size)
+                if not plan["available"]:
+                    code, message = plan["problem"]
+                    raise HlsError(code, message, 422)
 
-            await self._make_room(file_size)
+                await self._make_room(file_size)
 
-            directory = (self.cfg.cache_dir / str(int(file_id))).resolve()
-            directory.mkdir(parents=True, exist_ok=True)
-            job = HlsJob(
-                file_id=file_id, secure_hash=secure_hash, directory=directory,
-                tracks=probe.audio, mode=plan["mode"], probe=probe,
-            )
-            self.jobs[file_id] = job
-            try:
-                await self._spawn(job, source_url)
-                await self._wait_ready(job)
-                await self._write_master(job, file_size)
-            except HlsError as error:
-                self._failures[file_id] = (time.monotonic(), error)
-                await self._drop(file_id, f"failed: {error.code}")
-                raise
-            except Exception as error:
-                logger.exception("HLS start failed for file %s", file_id)
-                failure = HlsError("failed", "Audio switching could not be started", 500)
-                self._failures[file_id] = (time.monotonic(), failure)
-                await self._drop(file_id, "failed: unexpected")
-                raise failure from error
+                directory = (self.cfg.cache_dir / str(int(file_id))).resolve()
+                directory.mkdir(parents=True, exist_ok=True)
+                job = HlsJob(
+                    file_id=file_id, secure_hash=secure_hash, directory=directory,
+                    tracks=probe.audio, mode=plan["mode"], probe=probe,
+                )
+                self.jobs[file_id] = job
+                try:
+                    await self._spawn(job, source_url)
+                except Exception as error:
+                    logger.exception("HLS start failed for file %s", file_id)
+                    failure = HlsError("failed", "Audio switching could not be started", 500)
+                    self._failures[file_id] = (time.monotonic(), failure)
+                    await self._drop(file_id, "failed: spawn")
+                    raise failure from error
+                job.starter = asyncio.create_task(self._finish_start(job, file_size))
 
+        # waiting happens OUTSIDE the lock, so other requests are never blocked behind it
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(job.ready.wait()), wait)
+        if job.start_error is not None:
+            raise job.start_error
+        return job
+
+    async def _finish_start(self, job: HlsJob, file_size: int) -> None:
+        """Background part of a start: wait for the first segments, then write the master playlist."""
+        file_id = job.file_id
+        try:
+            await self._wait_ready(job)
+            await self._write_master(job, file_size)
             if job.state == "starting":  # _watch_exit may already have recorded complete/failed
                 job.state = "running"
-            return job
+        except asyncio.CancelledError:
+            raise
+        except HlsError as error:
+            job.start_error = error
+            self._failures[file_id] = (time.monotonic(), error)
+            await self._drop(file_id, f"failed: {error.code}")
+        except Exception as error:
+            logger.exception("HLS start failed for file %s", file_id)
+            failure = HlsError("failed", "Audio switching could not be started", 500)
+            job.start_error = failure
+            self._failures[file_id] = (time.monotonic(), failure)
+            await self._drop(file_id, "failed: unexpected")
+        finally:
+            job.ready.set()
 
     # ------------------------------------------------------ internals ----
 
@@ -659,6 +697,9 @@ class HlsManager:
         await self._terminate(job.process)
         for task in job.tasks:
             task.cancel()
+        if job.starter is not None and job.starter is not asyncio.current_task():
+            job.starter.cancel()
+        job.ready.set()
         directory = job.directory
         await asyncio.get_running_loop().run_in_executor(None, lambda: shutil.rmtree(directory, ignore_errors=True))
         logger.info("HLS job removed | file=%s | reason=%s", file_id, reason)
