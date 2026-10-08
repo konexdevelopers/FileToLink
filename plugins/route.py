@@ -237,6 +237,10 @@ async def hls_start_handler(request: web.Request):
         )
         job = await manager.get_or_start(file_id, secure_hash, source, probe, file_data.file_size or 0)
 
+        if job.state == "starting" or not job.master_path.exists():
+            # still preparing: answer quickly (a long-open request gets cut off by the host); the page asks again
+            return _json({"status": "preparing", "retry_after": 3}, 202, {"Retry-After": "3"})
+
         return _json({
             "status": "ok",
             # relative + hash in the PATH, so every playlist/segment URL inside inherits it
