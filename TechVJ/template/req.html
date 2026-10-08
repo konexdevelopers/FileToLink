@@ -329,15 +329,31 @@ a{color:inherit}
             if (state.hlsInfo) { return Promise.resolve(state.hlsInfo); }
             if (state.startPromise) { return state.startPromise; }
             if (state.ui) { state.ui.note("Preparing audio tracks\u2026"); }
-            state.startPromise = getJson("/hls-start/" + query()).then(function (r) {
-                if (!r.ok || r.data.status !== "ok" || !r.data.master) {
-                    var error = new Error(r.data.message || "Audio switching is not available");
+            /* the server answers "preparing" quickly and keeps working; we simply ask again until it is ready
+               (one long request would be cut off by the host after about a minute on big files) */
+            var deadline = Date.now() + 5 * 60 * 1000;
+            function pause(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+            function attempt() {
+                return getJson("/hls-start/" + query()).then(function (r) {
+                    if (r.ok && r.data.status === "ok" && r.data.master) {
+                        state.hlsInfo = r.data;
+                        return state.hlsInfo;
+                    }
+                    var transient = r.status === 202 || r.data.status === "preparing" ||
+                        (!r.data.code && (r.status === 502 || r.status === 503 || r.status === 504));
+                    if (transient && Date.now() < deadline) {
+                        return pause(Math.max(1500, (r.data.retry_after || 3) * 1000)).then(attempt);
+                    }
+                    var error = new Error(r.data.message ||
+                        (transient ? "Preparing the audio tracks is taking too long. Please try again in a moment." : "Audio switching is not available"));
                     error.code = r.data.code;
                     throw error;
-                }
-                state.hlsInfo = r.data;
-                return state.hlsInfo;
-            }).then(function (v) { state.startPromise = null; return v; }, function (e) { state.startPromise = null; throw e; });
+                }, function (networkError) {
+                    if (Date.now() < deadline) { return pause(3000).then(attempt); }
+                    throw networkError;
+                });
+            }
+            state.startPromise = attempt().then(function (v) { state.startPromise = null; return v; }, function (e) { state.startPromise = null; throw e; });
             return state.startPromise;
         }
 
@@ -469,85 +485,25 @@ a{color:inherit}
             refresh();
         }
 
-        /*
-         * Map our UI track index to the REAL hls.audioTracks index.
-         *
-         * hls.js exposes hls.audioTrack as an index into hls.audioTracks.
-         * Using the array index here is safer than depending on a separate
-         * backend/index value or on track.id being represented identically.
-         */
+        /* hls.js id -> UI index, using the REAL hls.audioTracks (never assuming both lists use the same order) */
         function buildMap(hls) {
             var real = hls.audioTracks || [];
+            var used = {};
             var map = [];
-
             state.tracks.forEach(function (track, i) {
                 var found = -1;
-
-                /* Exact label match first. */
                 for (var j = 0; j < real.length; j++) {
-                    if (real[j].name && real[j].name === label(i)) {
-                        found = j;
-                        break;
-                    }
+                    if (!used[j] && real[j].name === label(i)) { found = j; break; }
                 }
-
-                /* Language/code fallback. */
-                if (found < 0) {
-                    var wantedLang = String(
-                        track.language || track.lang || track.code || ""
-                    ).toLowerCase();
-
-                    if (wantedLang) {
-                        var wantedBase = wantedLang.split("-")[0];
-                        for (var k = 0; k < real.length; k++) {
-                            var realLang = String(real[k].lang || "").toLowerCase();
-                            var realBase = realLang.split("-")[0];
-                            if (realLang && (realLang === wantedLang || realBase === wantedBase)) {
-                                found = k;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                /* Final fallback: preserve the master/backend order. */
-                if (found < 0 && i < real.length) {
-                    found = i;
-                }
-
-                map.push(found);
+                if (found < 0 && real.length === state.tracks.length && !used[i]) { found = i; }
+                if (found >= 0) { used[found] = true; }
+                map.push(found >= 0 ? real[found].id : -1);
             });
-
             state.map = map;
-
-            log("Available HLS tracks:", real.map(function (t, i) {
-                return (
-                    i + ":" +
-                    (t.name || ("Track " + (i + 1))) +
-                    (t.lang ? "/" + t.lang : "") +
-                    (t["default"] ? " (default)" : "")
-                );
-            }));
-
-            log("UI -> HLS map:", map);
+            log("Available tracks:", real.map(function (t) { return (t.id + ":" + t.name + (t.lang ? "/" + t.lang : "") + (t["default"] ? " (default)" : "")); }));
         }
 
-        function uiIndexForHlsId(id) {
-            return state.map.indexOf(Number(id));
-        }
-
-        function syncHlsActive() {
-            if (!state.hls || state.backend !== "hlsjs") { return false; }
-
-            var current = Number(state.hls.audioTrack);
-            if (!Number.isFinite(current) || current < 0) { return false; }
-
-            var uiIndex = uiIndexForHlsId(current);
-            if (uiIndex < 0) { return false; }
-
-            onActual(uiIndex);
-            return true;
-        }
+        function uiIndexForHlsId(id) { return state.map.indexOf(id); }
 
         function armSwitchTimer() {
             clearTimeout(state.switchTimer);
@@ -677,39 +633,16 @@ a{color:inherit}
                         if (state.map.length < 2 || hls.audioTracks.length < 2) { reject(new Error("The audio tracks could not be loaded.")); return; }
                         state.mode = "hls";
                         state.backend = "hlsjs";
-                        state.switchable = true;
-
-                        /*
-                         * IMPORTANT: initialise the UI from the track that
-                         * HLS.js actually selected. Without this, state.active
-                         * can remain -1 and every audio dot stays grey until
-                         * another track-switch event happens.
-                         */
-                        syncHlsActive();
-
                         if (playing) { var p = video.play(); if (p && p.catch) { p.catch(function () {}); } }
                         resolve();
-                    } else {
-                        syncHlsActive();
+                    } else if (hls.audioTrack >= 0 && uiIndexForHlsId(hls.audioTrack) >= 0 && state.active < 0) {
+                        onActual(uiIndexForHlsId(hls.audioTrack));
                     }
                     refresh();
                 });
                 on(Hls.Events.AUDIO_TRACK_SWITCHED, function (event, data) {
                     if (hls !== state.hls || state.mode !== "hls") { return; }
-
-                    /*
-                     * hls.audioTrack is authoritative. data.id is kept as a
-                     * fallback for browser/version differences.
-                     */
-                    var actualId = Number(hls.audioTrack);
-                    if (!Number.isFinite(actualId) || actualId < 0) {
-                        actualId = data && Number(data.id);
-                    }
-
-                    var uiIndex = uiIndexForHlsId(actualId);
-                    if (uiIndex >= 0) {
-                        onActual(uiIndex);
-                    }
+                    onActual(uiIndexForHlsId(data.id));
                 });
                 on(Hls.Events.ERROR, function (event, data) {
                     if (hls !== state.hls || !data || !data.fatal) { return; }
