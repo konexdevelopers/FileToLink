@@ -278,7 +278,7 @@ a{color:inherit}
         window.__cvAudioController = true;
 
         var SWITCH_TIMEOUT_MS = 12000;
-        var COVERAGE_WAIT_MS = 120000;     // how long we keep watching the original file while HLS catches up
+        var COVERAGE_WAIT_MS = 30 * 60 * 1000;   // the original file keeps playing meanwhile, so waiting costs the viewer nothing
         var COVERAGE_MARGIN_S = 8;
 
         /* ONE source of truth. The dot in the menu is drawn from `active` only, and `active` is only ever
@@ -719,6 +719,11 @@ a{color:inherit}
                     Promise.all(names.map(function (n) { return playlistCoverage(base + n); })).then(function (list) {
                         var covered = list.every(function (c) { return c.ended || c.seconds >= need; });
                         if (covered) { resolve(info); return; }
+                        if (need > 0 && state.ui) {
+                            var done = Math.min.apply(null, list.map(function (c) { return c.ended ? need : c.seconds; }));
+                            var pct = Math.max(0, Math.min(99, Math.floor(done * 100 / need)));
+                            state.ui.note("Preparing audio tracks\u2026 " + pct + "%");
+                        }
                         if (Date.now() > deadline) { reject(new Error("The audio tracks are still being prepared for this part of the video.")); return; }
                         setTimeout(check, 1500);
                     }).catch(reject);
